@@ -339,7 +339,7 @@ const HOME_HTML = `<!doctype html>
 
     <footer>
       <span id="originLabel"></span>
-      <span>build B8-PROPHOOK · path-embedded</span>
+      <span>build B9-LEAN · path-embedded</span>
     </footer>
   </div>
 
@@ -1550,7 +1550,7 @@ class ScriptInjector {
       try {
         Element.prototype.setAttribute = function(name, value) {
           try {
-            if (RELAY_URL_ATTR_NAMES[String(name).toLowerCase()] && typeof value === 'string') {
+            if (RELAY_URL_ATTR_NAMES[name] && typeof value === 'string') {
               value = toProxied(value);
             }
           } catch (e) {}
@@ -1559,7 +1559,7 @@ class ScriptInjector {
         Element.prototype.getAttribute = function(name) {
           var v = relayNativeGetAttr.call(this, name);
           try {
-            if (RELAY_URL_ATTR_NAMES[String(name).toLowerCase()]) return fromProxied(v);
+            if (RELAY_URL_ATTR_NAMES[name]) return fromProxied(v);
           } catch (e) {}
           return v;
         };
@@ -1614,7 +1614,7 @@ class ScriptInjector {
         panel.innerHTML =
           '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;' +
           'padding:6px 8px;background:#1a1a1a;border-bottom:1px solid #333;">' +
-          '<span style="color:#ccc;">relay B8-PROPHOOK \u2014 failed requests</span>' +
+          '<span style="color:#ccc;">relay B9-LEAN \u2014 failed requests</span>' +
           '<span style="display:flex;gap:10px;align-items:center;">' +
           '<button id="__relay_debug_copy" style="background:none;border:1px solid #444;' +
           'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:2px 6px;">Copy</button>' +
@@ -2010,44 +2010,14 @@ class ScriptInjector {
       if (typeof MutationObserver === 'function') {
         var relayObserver = new MutationObserver(function(mutations) {
           for (var i = 0; i < mutations.length; i++) {
-            var m = mutations[i];
-            if (m.type === 'attributes' && m.target.nodeType === 1) {
-              relayRewriteElement(m.target);
-            } else if (m.type === 'childList') {
-              for (var j = 0; j < m.addedNodes.length; j++) {
-                relayScanForUrlElements(m.addedNodes[j]);
-              }
+            var addedNodes = mutations[i].addedNodes;
+            for (var j = 0; j < addedNodes.length; j++) {
+              relayScanForUrlElements(addedNodes[j]);
             }
           }
         });
-        relayObserver.observe(document.documentElement, {
-          childList: true,
-          subtree: true,
-          attributes: true,
-          attributeFilter: ['href', 'src', 'data']
-        });
+        relayObserver.observe(document.documentElement, { childList: true, subtree: true });
       }
-
-      // Hovering a link is itself a common trigger for a React re-render
-      // (hover-state UI update, prefetch-on-hover, impression tracking) —
-      // and that re-render reverts the href back to React's own internal
-      // record of the raw URL, since it was never told about our external
-      // fix. The browser's status-bar hover preview reads whatever's
-      // actually in the DOM at that exact moment, so relying solely on the
-      // MutationObserver/polling to eventually catch up leaves a real
-      // window, right at hover time, where the raw URL is genuinely what's
-      // there. Capture phase runs before React's typically bubble-phase
-      // event delegation gets a chance to trigger that re-render, so
-      // re-asserting the fix here — right as the hover begins — closes
-      // that window rather than racing to win it after the fact.
-      document.addEventListener('mouseover', function(e) {
-        var path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
-        for (var i = 0; i < path.length; i++) {
-          if (path[i] && RELAY_URL_ATTRS[path[i].tagName]) {
-            relayRewriteElement(path[i]);
-          }
-        }
-      }, true);
 
       // Shared by 'click' and 'auxclick' below — auxclick is what fires for
       // middle-click/open-in-new-tab, a DIFFERENT event from 'click' that
@@ -2175,4 +2145,4 @@ class ScriptInjector {
       { html: true }
     );
   }
-  }
+}
