@@ -39,6 +39,9 @@
 //   client-side WebSocket override below) — browser <-> Worker <-> real
 //   target, including converting the handshake's Origin header to the real
 //   target's own origin, since many WS servers reject a mismatched one.
+// - Every regex inside the ScriptInjector template below is DOUBLE-escaped
+//   (\\/ etc.): the template literal consumes one level of backslashes, so
+//   single-escaped regexes arrive at the browser corrupted (\\/ck\\/a$ //   collapsing to a line comment, killing the whole injected script).
 
 const SW_PATH = '/__proxy_sw.js';
 
@@ -339,7 +342,7 @@ const HOME_HTML = `<!doctype html>
 
     <footer>
       <span id="originLabel"></span>
-      <span>build B11-AUTHFIX · path-embedded __RELAY_LOGOUT_LINK__</span>
+      <span>build B13-ESCFIX · path-embedded __RELAY_LOGOUT_LINK__</span>
     </footer>
   </div>
 
@@ -995,6 +998,25 @@ export default {
       }
     }
 
+    // Placed after the Referer-recovery block above on purpose: a favicon
+    // request issued from a proxied page carries a Referer and gets
+    // redirected to the TARGET's own favicon — keep that. These only need
+    // handling when recovery can't fire (homepage visits, stripped
+    // referrers, crawlers), where they'd otherwise fall through to the
+    // bare-hostname path and trigger a doomed upstream fetch of
+    // https://favicon.ico plus a rendered 502 on every homepage visit.
+    if (url.pathname === '/favicon.ico') {
+      return new Response(null, {
+        status: 204,
+        headers: { 'Cache-Control': 'public, max-age=86400' }
+      });
+    }
+    if (url.pathname === '/robots.txt') {
+      return new Response('User-agent: *\nDisallow: /\n', {
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+      });
+    }
+
     // Path-embedded target, e.g. "/https://example.com/page" + "?x=1"
     let targetUrl = url.pathname.slice(1) + url.search;
 
@@ -1041,7 +1063,17 @@ export default {
     // GET-only — the Cache API throws on non-GET requests.
     const cacheable = request.method === 'GET';
     const cache = caches.default;
-    const cacheKey = new Request(request.url, request);
+    // The cache key embeds a token derived from the request's Accept header:
+    // the real browser's Accept is forwarded upstream, so the same URL can
+    // legitimately have different bytes per browser (AVIF vs WebP vs PNG).
+    // Keying on URL alone served the first visitor's format to everyone for
+    // the full TTL. The token exists only in the cache key — the upstream
+    // fetch still uses the untouched target URL.
+    const acceptToken = request.headers.get('Accept') || 'no-accept';
+    const cacheKey = new Request(
+      request.url + (url.search ? '&' : '?') + '__relay_acc=' + encodeURIComponent(acceptToken),
+      request
+    );
     if (cacheable) {
       const cached = await cache.match(cacheKey);
       if (cached) return cached;
@@ -1056,7 +1088,12 @@ export default {
       // already the same generic, non-personalized view for everyone, so
       // caching it at Cloudflare's fetch layer (not just our own edge
       // cache below) cuts a real origin round-trip on repeat hits.
-      cf: { cacheTtl: 120, cacheEverything: true }
+      // cacheTtlByStatus, not cacheTtl: with cacheEverything, cacheTtl
+      // applies to error statuses too, so a single transient 500/404 was
+      // replayed from Cloudflare's cache to every visitor for the full
+      // TTL. 1s on the error ranges is effectively "don't cache" without
+      // relying on 0-TTL handling.
+      cf: { cacheEverything: true, cacheTtlByStatus: { '200-299': 120, '400-499': 1, '500-599': 1 } }
     };
     // Forward the real request body for non-GET/HEAD methods — previously
     // every upstream fetch was an implicit GET regardless of the incoming
@@ -1085,13 +1122,20 @@ export default {
     }
 
     const contentType = upstream.headers.get('content-type') || '';
+    // XHTML is rewritable too — previously application/xhtml+xml streamed
+    // through untouched (raw links, no injected script). Served as
+    // text/html below, which real-world XHTML renders under fine; the one
+    // known hazard is XHTML's legal self-closing external <script/>,
+    // which HTML parsing treats as an unclosed <script> tag.
+    const isHtml =
+      contentType.includes('text/html') || contentType.includes('application/xhtml+xml');
 
     // Non-HTML: stream through untouched, but for static asset types (JS,
     // CSS, fonts, images) that browsers otherwise under-cache, extend
     // Cache-Control client-side AND store at the edge — a chunk fetched by
     // one visitor is then served instantly to the next, skipping the origin
     // and the Worker's rewriting path entirely.
-    if (!contentType.includes('text/html')) {
+    if (!isHtml) {
       // Search engines increasingly deliver actual result data via a
       // separate payload fetched by client-side JS (confirmed for
       // DuckDuckGo's links.duckduckgo.com/d.js) rather than embedding
@@ -1107,16 +1151,19 @@ export default {
       if (SEARCH_DATA_HOSTS.has(parsedTarget.hostname)) {
         const text = await upstream.text();
         const rewritten = rewriteEmbeddedUrls(text, upstream.url || parsedTarget.href, proxyOrigin);
+        const dataHeaders = new Headers(upstream.headers);
+        dataHeaders.delete('Set-Cookie');
         return new Response(rewritten, {
           status: upstream.status,
           statusText: upstream.statusText,
-          headers: upstream.headers
+          headers: dataHeaders
         });
       }
 
       if (upstream.status === 200 && isLongCacheable(contentType)) {
         const headers = new Headers(upstream.headers);
         headers.set('Cache-Control', 'public, max-age=86400');
+        headers.delete('Set-Cookie');
         const asset = new Response(upstream.body, {
           status: upstream.status,
           statusText: upstream.statusText,
@@ -1132,7 +1179,7 @@ export default {
         if (cacheable && !tooLargeToCache) ctx.waitUntil(cache.put(cacheKey, asset.clone()));
         return asset;
       }
-      return upstream;
+      return stripSetCookie(upstream);
     }
 
     // upstream.url is the FINAL URL after any redirects fetch() followed
@@ -1338,6 +1385,28 @@ function isLongCacheable(contentType) {
   return STATIC_CACHE_TYPES.some((t) => contentType.includes(t));
 }
 
+// Target-issued Set-Cookie headers land on the proxy's OWN origin when
+// passed through to the browser — where any other proxied page can read
+// them via document.cookie, since everything shares this origin. And since
+// cookies are never forwarded upstream, they're never used for anything
+// either. Strip on every non-HTML path (the HTML path already rebuilds its
+// headers from scratch). Only re-wraps when a Set-Cookie is actually
+// present, so the streaming passthrough is untouched otherwise.
+function stripSetCookie(response) {
+  if (!response.headers.has('Set-Cookie')) return response;
+  try {
+    const headers = new Headers(response.headers);
+    headers.delete('Set-Cookie');
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers
+    });
+  } catch {
+    return response; // fall back to today's behavior rather than fail the request
+  }
+}
+
 // Known search-engine data endpoints — the actual result payload, not the
 // page shell. Confirmed for DuckDuckGo by inspecting its response directly;
 // add others here once their equivalent endpoint is identified the same way
@@ -1364,16 +1433,6 @@ function rewriteEmbeddedUrls(text, baseUrl, proxyOrigin) {
   });
 }
 
-// Bing (and similar) wrap search-result links in a server-side
-// click-tracking redirect (bing.com/ck/a?...&u=a1<base64>...) that serves
-// an interstitial page whose own JS then navigates onward — commonly via a
-// direct, unpatchable location assignment straight to the real external
-// destination, which escapes the proxy entirely (window.location can't be
-// intercepted from page JS, and the resulting request never reaches this
-// Worker to be recovered server-side). Decoding the real destination here
-// and linking straight to it skips the interstitial, and its escape,
-// altogether. Falls through to the tracking URL unchanged if the pattern
-// or encoding doesn't match — never breaks the link.
 // Major search engines wrap result links in a server-side click-tracking
 // redirect that serves an interstitial page whose own JS then navigates
 // onward — commonly via a direct, unpatchable location assignment straight
@@ -1544,7 +1603,11 @@ class BaseTagInjector {
     this.proxiedBase = proxiedBase;
   }
   element(el) {
-    el.prepend(`<base href="${this.proxiedBase}">`, { html: true });
+    // proxiedBase is target-controlled (it's upstream.url — the final
+    // redirect destination). URL normalization percent-encodes quotes, so
+    // breakout *shouldn't* be reachable — but don't rely on that implicitly:
+    // escape before interpolating into markup.
+    el.prepend(`<base href="${escapeHtml(this.proxiedBase)}">`, { html: true });
   }
 }
 
@@ -1600,6 +1663,9 @@ class ScriptInjector {
       // the page by the site's OWN JavaScript (very likely, given how
       // JS-heavy modern search results rendering is) never passes through
       // server-side rewriting at all, only through this client-side path.
+      // NOTE: every regex here is double-escaped (\\\\/ etc.) because this
+      // whole script lives inside a template literal — one level of
+      // backslashes is consumed when the template evaluates.
       function decodeTrackingRedirectClient(rawValue, baseUrl) {
         var u;
         try {
@@ -1607,26 +1673,26 @@ class ScriptInjector {
         } catch (e) {
           return null;
         }
-        if (/\/ck\/a$/i.test(u.pathname)) {
+        if (/\\/ck\\/a$/i.test(u.pathname)) {
           var encoded = u.searchParams.get('u');
           if (encoded && encoded.slice(0, 2) === 'a1') {
             try {
               var b64 = encoded.slice(2).replace(/-/g, '+').replace(/_/g, '/');
               while (b64.length % 4 !== 0) b64 += '=';
               var decoded = atob(b64);
-              if (/^https?:\/\//i.test(decoded)) return decoded;
+              if (/^https?:\\/\\//i.test(decoded)) return decoded;
             } catch (e) {}
           }
           return null;
         }
-        if (/^\/url$/i.test(u.pathname) && /(^|\.)google\.[a-z.]+$/i.test(u.hostname)) {
+        if (/^\\/url$/i.test(u.pathname) && /(^|\\.)google\\.[a-z.]+$/i.test(u.hostname)) {
           var q = u.searchParams.get('q');
-          if (q && /^https?:\/\//i.test(q)) return q;
+          if (q && /^https?:\\/\\//i.test(q)) return q;
           return null;
         }
-        if (/^\/l\/?$/i.test(u.pathname) && /(^|\.)duckduckgo\.com$/i.test(u.hostname)) {
+        if (/^\\/l\\/?$/i.test(u.pathname) && /(^|\\.)duckduckgo\\.com$/i.test(u.hostname)) {
           var uddg = u.searchParams.get('uddg');
-          if (uddg && /^https?:\/\//i.test(uddg)) return uddg;
+          if (uddg && /^https?:\\/\\//i.test(uddg)) return uddg;
           return null;
         }
         return null;
@@ -1697,7 +1763,7 @@ class ScriptInjector {
         var prefix = proxyOrigin + '/';
         if (url.indexOf(prefix) === 0) {
           var rest = url.slice(prefix.length);
-          if (/^https?:\/\//i.test(rest)) return rest;
+          if (/^https?:\\/\\//i.test(rest)) return rest;
         }
         return url;
       }
@@ -1760,6 +1826,15 @@ class ScriptInjector {
       var __relayFailures = [];
       var MAX_LOGGED = 15;
 
+      // Single escape point for the debug panel: rows interpolate strings
+      // that are page-controlled (fetch/XHR input URLs) or target-server-
+      // controlled (WebSocket close reasons), straight into innerHTML.
+      function relayEsc(s) {
+        return String(s).replace(/[&<>"']/g, function(c) {
+          return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+      }
+
       function relayEnsurePanel() {
         if (document.getElementById('__relay_debug_panel')) return;
         var panel = document.createElement('div');
@@ -1771,7 +1846,7 @@ class ScriptInjector {
         panel.innerHTML =
           '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;' +
           'padding:6px 8px;background:#1a1a1a;border-bottom:1px solid #333;">' +
-          '<span style="color:#ccc;">relay B11-AUTHFIX \u2014 failed requests</span>' +
+          '<span style="color:#ccc;">relay B13-ESCFIX \u2014 failed requests</span>' +
           '<span style="display:flex;gap:10px;align-items:center;">' +
           '<button id="__relay_debug_copy" style="background:none;border:1px solid #444;' +
           'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:2px 6px;">Copy</button>' +
@@ -1786,7 +1861,7 @@ class ScriptInjector {
           var btn = document.getElementById('__relay_debug_copy');
           var text = __relayFailures.map(function(r) {
             return r.status + ' ' + r.method + ' ' + r.url + (r.note ? ' - ' + r.note : '');
-          }).join('\n');
+          }).join('\\n');
           function done(ok) { btn.textContent = ok ? 'Copied!' : 'Copy failed'; setTimeout(function() { btn.textContent = 'Copy'; }, 1500); }
           if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(text).then(function() { done(true); }, function() { done(false); });
@@ -1807,13 +1882,14 @@ class ScriptInjector {
           panel.style.display = 'block';
           list.innerHTML = __relayFailures.map(function(r) {
             return '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#eee;' +
-              'word-break:break-all;"><b style="color:#ff8a63;">' + r.status + '</b> ' +
-              r.method + ' ' + r.url + (r.note ? ' \u2014 ' + r.note : '') + '</div>';
+              'word-break:break-all;"><b style="color:#ff8a63;">' + relayEsc(r.status) + '</b> ' +
+              relayEsc(r.method) + ' ' + relayEsc(r.url) + (r.note ? ' \u2014 ' + relayEsc(r.note) : '') + '</div>';
           }).join('');
         } catch (e) {}
       }
 
-      // own script 404ing) don't fire on fetch/XHR/WebSocket at all, and
+      // Resource load failures (a broken image, a CSS file 404ing, a
+      // script 404ing) don't fire on fetch/XHR/WebSocket at all, and
       // these error events don't bubble — a capture-phase listener on
       // window is the only way to observe them globally. Previously
       // invisible to this panel entirely, despite being a very common
@@ -1828,9 +1904,10 @@ class ScriptInjector {
       }, true);
       // ---------------------------------------------------------------
 
-      // calls fetch()/XHR with relative or root-relative URLs. Route them
-      // through the proxy - same-origin from the browser's perspective, so
-      // no CORS issue (the Worker does the real cross-origin fetch server-side).
+      // Patched fetch: pages commonly call fetch()/XHR with relative or
+      // root-relative URLs. Route them through the proxy — same-origin from
+      // the browser's perspective, so no CORS issue (the Worker does the
+      // real cross-origin fetch server-side).
       try {
         var origFetch = window.fetch;
         window.fetch = function(input, init) {
@@ -1840,13 +1917,24 @@ class ScriptInjector {
             if (typeof input === 'string') {
               input = toProxied(input);
             } else if (input && input.url) {
-              input = new Request(toProxied(input.url), {
+              // input.body on a Request is a ReadableStream, and the Request
+              // constructor throws on a streamed body unless duplex:'half' is
+              // present — the throw was swallowed by the catch below, so any
+              // fetch() called with a Request object carrying a POST body ran
+              // against the raw, un-proxied URL. Mirrors the worker-side
+              // upstreamInit. Browsers without streaming-request support
+              // throw here either way, so this is never a regression.
+              var reqInit = {
                 method: input.method,
                 headers: input.headers,
-                body: ['GET', 'HEAD'].includes(input.method) ? undefined : input.body,
                 credentials: input.credentials,
                 redirect: input.redirect
-              });
+              };
+              if (input.body !== null && !['GET', 'HEAD'].includes(input.method)) {
+                reqInit.body = input.body;
+                reqInit.duplex = 'half';
+              }
+              input = new Request(toProxied(input.url), reqInit);
             }
           } catch (e) {}
           return origFetch.call(this, input, init).then(function(res) {
@@ -2021,15 +2109,6 @@ class ScriptInjector {
         }
       } catch (e) {}
 
-      // Use the RAW href attribute (not the browser-resolved .href), since a
-      // root-relative raw value resolved natively would incorrectly bind to
-      // the proxy's own origin rather than the real target's.
-      //
-      // Bubble phase (not capture), and back off if the page's own JS
-      // already called preventDefault(). Sites commonly wrap non-navigating
-      // controls — dropdown/menu triggers, tabs — in an <a> for styling and
-      // handle the click themselves; capturing first stole those clicks and
-      // forced a full reload instead of letting the page open its menu.
       // SPA client-side routing (history.pushState/replaceState) changes the
       // address bar directly, with no network request at all — none of the
       // fetch/XHR/WebSocket interceptors above can see this. A page's own
@@ -2076,20 +2155,6 @@ class ScriptInjector {
         relayUpdateBaseTag(location.href);
       });
 
-      // Capture phase: must run BEFORE the page's own click-tracking-then-
-      // navigate handlers, not after. Search engines commonly intercept
-      // result clicks (preventDefault, log a beacon) then navigate via
-      // their own location.href assignment shortly after — bubble phase +
-      // checking e.defaultPrevented (an earlier approach) saw
-      // defaultPrevented=true from that same preventDefault call and backed
-      // off, letting their un-proxied navigation through untouched. That's
-      // what let every search engine's result clicks escape the proxy.
-      //
-      // Skip elements that are semantically UI controls (menu/dropdown
-      // triggers, tabs) rather than real navigation, using ARIA attributes
-      // rather than timing — this preserves the original reason bubble
-      // phase was tried (GitHub-style menus wrapped in <a> that the page
-      // handles itself) without needing to run after the page to detect it.
       // Dynamically-created content (React, Vue, or any JS setting
       // href/src directly from already-fetched data) never passes through
       // server-side HTMLRewriter (which only sees the initial HTML) NOR
@@ -2150,8 +2215,11 @@ class ScriptInjector {
           var anchors = document.querySelectorAll('a[href]');
           var found = [];
           for (var i = 0; i < anchors.length && found.length < 5; i++) {
-            var href = anchors[i].getAttribute('href');
-            if (!/^https?:\/\//i.test(href)) continue; // only absolute http(s) hrefs are unambiguous
+            // Native accessor, same reason as relayRewriteElement: the hooked
+            // getAttribute unwraps proxified URLs back to the real target,
+            // which made every correctly-rewritten link read as "stale".
+            var href = relayNativeGetAttr.call(anchors[i], 'href');
+            if (!/^https?:\\/\\//i.test(href)) continue; // only absolute http(s) hrefs are unambiguous
             if (href.indexOf(proxyOrigin) === 0) continue; // already correctly proxied
             found.push(href);
           }
@@ -2176,10 +2244,28 @@ class ScriptInjector {
         relayObserver.observe(document.documentElement, { childList: true, subtree: true });
       }
 
-      // Shared by 'click' and 'auxclick' below — auxclick is what fires for
-      // middle-click/open-in-new-tab, a DIFFERENT event from 'click' that
-      // this interceptor never saw before, so that path always used the
-      // raw, un-rewritten href with no interception at all.
+      // Link click interception. Capture phase: must run BEFORE the page's
+      // own click-tracking-then-navigate handlers, not after. Search
+      // engines commonly intercept result clicks (preventDefault, log a
+      // beacon) then navigate via their own location.href assignment
+      // shortly after — bubble phase + checking e.defaultPrevented (an
+      // earlier approach) saw defaultPrevented=true from that same
+      // preventDefault call and backed off, letting their un-proxied
+      // navigation through untouched. That's what let every search
+      // engine's result clicks escape the proxy.
+      //
+      // Skip elements that are semantically UI controls (menu/dropdown
+      // triggers, tabs) rather than real navigation, using ARIA attributes
+      // rather than timing — this preserves GitHub-style menus wrapped in
+      // <a> that the page handles itself. role="button" and aria-expanded
+      // are deliberately NOT used as skip signals: both are commonly
+      // applied to genuine navigating links too, and treating either as a
+      // skip let those escape uncontrolled.
+      //
+      // 'click' and 'auxclick' share this handler — auxclick is what fires
+      // for middle-click/open-in-new-tab, a DIFFERENT event from 'click',
+      // so that path otherwise used the raw, un-rewritten href with no
+      // interception at all.
       function relayHandleLinkClick(e) {
         if (e.defaultPrevented) return;
         // e.target is retargeted to the shadow host for clicks originating
@@ -2206,7 +2292,7 @@ class ScriptInjector {
               var cls = clickedEl.className;
               var desc = clickedEl.tagName +
                 (clickedEl.id ? '#' + clickedEl.id : '') +
-                (typeof cls === 'string' && cls ? '.' + cls.trim().split(/\s+/).join('.') : '');
+                (typeof cls === 'string' && cls ? '.' + cls.trim().split(/\\s+/).join('.') : '');
               relayLogFailure(e.type.toUpperCase(), desc, 'NO_LINK', 'no <a> found in click path');
             }
           } catch (err) {}
@@ -2214,12 +2300,6 @@ class ScriptInjector {
         }
         // aria-haspopup is a strong, unambiguous signal that this isn't
         // real navigation — it specifically means "opens a menu/dialog".
-        // role="button" and aria-expanded are NOT reliable signals — both
-        // are commonly applied to genuine navigating links too (component
-        // libraries often mark any clickable-styled element this way,
-        // search result titles included, regardless of whether it
-        // navigates), and treating either as a skip signal let those
-        // escape uncontrolled. Deliberately excluded.
         var haspopup = link.getAttribute('aria-haspopup');
         var isUiControl = haspopup && haspopup.toLowerCase() !== 'false';
         if (isUiControl) return;
@@ -2238,8 +2318,8 @@ class ScriptInjector {
         // exactly the kind of pattern some browsers' popup blockers flag.
         if (raw.indexOf(proxyOrigin + '/http') === 0) return;
         e.preventDefault();
-        // Without this, the page's own handler still runs afterward (
-        // preventDefault doesn't stop propagation) and its un-proxied
+        // Without this, the page's own handler still runs afterward
+        // (preventDefault doesn't stop propagation) and its un-proxied
         // location.href assignment would overwrite ours a moment later —
         // same tick, last assignment wins.
         e.stopImmediatePropagation();
