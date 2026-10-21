@@ -1,8 +1,0 @@
-{
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "relay",
-  "main": "./_worker.js",
-  "compatibility_date": "2026-10-01",
-  "workers_dev": true,
-  "observability": { "enabled": true }
-}

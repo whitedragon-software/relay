@@ -1,0 +1,27 @@
+# Wrangler deploy config for relay — converted from wrangler.jsonc.
+# Wrangler (v3.91.0 and up) fully supports TOML; same keys, same values,
+# only the syntax differs.
+#
+# Keep exactly ONE config file in this folder. Wrangler reads a single
+# config file, and when several are present it picks by its own internal
+# order — delete the old wrangler.jsonc (or move it into archive/) so
+# there is no ambiguity about which config is live.
+
+name = "relay"
+main = "_worker.js"
+
+# REPLACE with the compatibility_date from your old wrangler.jsonc,
+# verbatim. "2025-01-01" below is only a placeholder that keeps this
+# file valid. The compatibility date is a bundle of runtime behavior
+# flags for the Workers runtime — it should not drift just because the
+# config file format changed.
+
+compatibility_date = "2026-10-01"
+
+# Plain-text environment variables. Keep this table empty on purpose:
+# PASSWORD is a secret (npx wrangler secret put PASSWORD, or dashboard
+# → Variables and Bindings → Add → Secret) and secrets are managed
+# outside this file — a deploy never removes them. With PASSWORD unset,
+# the relay behaves exactly as before.
+
+[vars]
