@@ -1,29 +1,20 @@
-// Wrangler deploy config for relay — back on wrangler.jsonc (TOML
-// experiment reverted). Every Wrangler v3/v4 release picks this up,
-// and it is the format Wrangler itself points to in its
-// "Missing entry-point" hint.
+// Deploy config for the relay Worker.
+// Read by `npx wrangler deploy` — locally, or by Workers Builds on push.
 //
-// Keep exactly ONE config file in this folder: if a leftover
-// wrangler.toml is still lying around, delete it (or move it into
-// archive/) so there is no ambiguity about which config is live.
+// compatibility_date: copy it verbatim from the dashboard
+// (Workers & Pages → relay → Settings tab → Compatibility date).
+// If you can't find it, "2025-01-01" is safe for this worker —
+// none of its code depends on compatibility-date-gated behavior.
 
 {
-  // REPLACE "2025-01-01" with the compatibility_date your relay
-  // originally shipped with — it must not drift during a config
-  // revert. Lost the old file? The live value is readable in the
-  // dashboard: Workers & Pages → relay → Settings → Compatibility
-  // date. (Best option of all: restore your original wrangler.jsonc
-  // from archive/ or git history — that file is authoritative.)
-
   "name": "relay",
   "main": "_worker.js",
   "compatibility_date": "2025-01-01",
 
-  // Plain-text environment variables. Keep this block empty on
-  // purpose: PASSWORD is a secret (npx wrangler secret put PASSWORD,
-  // or dashboard → Variables and Bindings → Add → Secret) and secrets
-  // are managed outside this file — a deploy never removes them.
-  // With PASSWORD unset, the relay behaves exactly as before.
+  // Keep `vars` empty on purpose: PASSWORD is a secret, and secrets
+  // are set outside this file (npx wrangler secret put PASSWORD, or
+  // dashboard → Settings → Variables and Bindings → Add → Secret).
+  // A deploy never removes them.
 
   "vars": {}
-    }
+}
