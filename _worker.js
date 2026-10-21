@@ -1,4 +1,5 @@
 // Cloudflare Workers forwarding proxy — path-embedded scheme.
+// 
 // Target URLs are embedded directly in the proxy's path instead of a query
 // param: https://proxy.dev/https://example.com/page?x=1
 // (Old bookmarks using ?url=... still work as a fallback.)
