@@ -1,20 +1,4 @@
-// Deploy config for the relay Worker.
-// Read by `npx wrangler deploy` — locally, or by Workers Builds on push.
-//
-// compatibility_date: copy it verbatim from the dashboard
-// (Workers & Pages → relay → Settings tab → Compatibility date).
-// If you can't find it, "2025-01-01" is safe for this worker —
-// none of its code depends on compatibility-date-gated behavior.
-
 {
-  "name": "relay",
   "main": "_worker.js",
-  "compatibility_date": "2025-01-01",
-
-  // Keep `vars` empty on purpose: PASSWORD is a secret, and secrets
-  // are set outside this file (npx wrangler secret put PASSWORD, or
-  // dashboard → Settings → Variables and Bindings → Add → Secret).
-  // A deploy never removes them.
-
-  "vars": {}
+  "compatibility_date": "2025-07-13"
 }
