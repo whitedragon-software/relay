@@ -1,7 +1,7 @@
 # Wrangler deploy config for relay — converted from wrangler.jsonc.
 # Wrangler (v3.91.0 and up) fully supports TOML; same keys, same values,
 # only the syntax differs.
-#
+
 # Keep exactly ONE config file in this folder. Wrangler reads a single
 # config file, and when several are present it picks by its own internal
 # order — delete the old wrangler.jsonc (or move it into archive/) so
