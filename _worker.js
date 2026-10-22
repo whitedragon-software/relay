@@ -62,6 +62,14 @@ self.addEventListener('fetch', (event) => {
   const req = event.request;
   const url = new URL(req.url);
 
+  // Some routers (Next.js) collapse "//" in paths: /https://host -> /https:/host.
+  // Restore the double slash instead of treating it as a root-relative path.
+  const collapsed = url.pathname.match(/^\\/(https?):\\/(?!\\/)(.*)$/i);
+  if (collapsed) {
+    event.respondWith(Response.redirect(self.location.origin + '/' + collapsed[1] + '://' + collapsed[2] + url.search, 302));
+    return;
+  }
+
   // Already correctly path-embedded, or the SW script/root usage page — leave alone.
   if (/^\\/https?:\\/\\//.test(url.pathname)) return;
   if (url.pathname === '${SW_PATH}') return;
@@ -1112,9 +1120,11 @@ export default {
       upstreamInit.duplex = 'half';
     }
 
+    const upstreamHref = stripProxyFromQuery(parsedTarget, proxyOrigin);
+
     let upstream;
     try {
-      upstream = await fetchUpstream(parsedTarget.href, upstreamInit);
+      upstream = await fetchUpstream(upstreamHref, upstreamInit);
     } catch (error) {
       return errorResponse(proxyOrigin, 502, "Couldn't reach that address", 'The request to the target failed before any response came back.', error.message, parsedTarget.href);
     }
@@ -1198,7 +1208,7 @@ export default {
     if (request.method === 'GET' && request.headers.get('Sec-Fetch-Mode') === 'navigate' && upstream.url) {
       try {
         const finalUrl = new URL(upstream.url);
-        const requestedUrl = new URL(parsedTarget.href);
+        const requestedUrl = new URL(upstreamHref);
         finalUrl.hash = '';
         requestedUrl.hash = '';
         if (finalUrl.href !== requestedUrl.href && finalUrl.origin !== proxyOrigin) {
@@ -1256,6 +1266,23 @@ export default {
 
 function proxify(absoluteUrl, proxyOrigin) {
   return proxyOrigin + '/' + absoluteUrl;
+}
+
+// Page JS sometimes puts its own location.href into a query parameter
+// (consent managers do: href=<relay>/https://www.bbc.com/news). The upstream
+// server validates that against its registered domains and rejects the
+// relay-wrapped form (400), so unwrap it back to the real URL before
+// forwarding. Query string only; everything else is untouched.
+function stripProxyFromQuery(parsed, proxyOrigin) {
+  if (!parsed.search) return parsed.href;
+  const encoded = encodeURIComponent(proxyOrigin + '/');
+  const encodedLower = encoded.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
+  let search = parsed.search.split(encoded).join('').split(encodedLower).join('');
+  search = search.split(proxyOrigin + '/').join('');
+  if (search === parsed.search) return parsed.href;
+  const u = new URL(parsed.href);
+  u.search = search;
+  return u.href;
 }
 
 // Headers we set ourselves, that leak the proxy's own domain if forwarded
@@ -1751,7 +1778,7 @@ class ScriptInjector {
           // scheme) and fed it back into history/URL APIs. Never re-resolve
           // it against the real site, or the target gets embedded twice.
           // The second form is the same path after a framework collapsed "//".
-          if (/^\\/https?:\\//i.test(raw)) return proxyOrigin + raw;
+          if (/^\\/https?:\\/\\//i.test(raw)) return proxyOrigin + raw;
           if (/^\\/https?:\\/(?!\\/)/i.test(raw)) return proxyOrigin + '/' + fixSlashes(raw.slice(1));
           // Already a fully-proxied absolute URL (server-rewritten) — but
           // that doesn't mean there's nothing left to fix. The wrapped
@@ -1882,6 +1909,9 @@ class ScriptInjector {
       // divs, spans). They are not failures. Flip to true only when hunting
       // for link-less navigation that escapes the proxy.
       var RELAY_LOG_NO_LINK = false;
+      // Logs every history.pushState/replaceState call (original -> proxied).
+      // Turn on to see exactly which URL page JS handed the router.
+      var RELAY_LOG_NAV = false;
 
       // Single escape point for the debug panel: rows interpolate strings
       // that are page-controlled (fetch/XHR input URLs) or target-server-
@@ -2223,17 +2253,50 @@ class ScriptInjector {
       // patching, the click/submit interceptors). A postMessage patch
       // failing should cost only postMessage rewriting, not every
       // safety-critical patch that comes after it in the file.
-      try {
-        if (typeof Window !== 'undefined' && Window.prototype && Window.prototype.postMessage) {
-          var origPostMessage = Window.prototype.postMessage;
-          Window.prototype.postMessage = function(message, targetOrigin, transfer) {
+      // postMessage's targetOrigin check can never pass under this proxy: the
+      // page author writes the REAL origin, but every frame is served from OUR
+      // origin. For the Window interface, postMessage is an OWN property of
+      // each window object, not of Window.prototype, so the earlier prototype
+      // patch never took effect. Patch the instance instead, and patch
+      // same-origin iframe windows (including about:blank ones the page
+      // creates itself, which never run this script) the first time the page
+      // touches them via iframe.contentWindow.
+      // Rewriting targetOrigin to '*' trades away the origin check the page
+      // author intended, for correctness of delivery.
+      function relayPatchPostMessage(w) {
+        try {
+          if (!w || w.__relayPM) return;
+          var orig = w.postMessage;
+          if (typeof orig !== 'function') return;
+          var wrapped = function(message, targetOrigin) {
+            var args = Array.prototype.slice.call(arguments);
             try {
-              if (typeof targetOrigin === 'string' && targetOrigin !== '*') {
-                targetOrigin = '*';
+              var t = args[1];
+              if (typeof t === 'string' && t !== '*') {
+                args[1] = '*';
+              } else if (t && typeof t === 'object' && typeof t.targetOrigin === 'string' && t.targetOrigin !== '*') {
+                args[1] = Object.assign({}, t, { targetOrigin: '*' });
               }
             } catch (e) {}
-            return origPostMessage.call(this, message, targetOrigin, transfer);
+            return orig.apply(w, args);
           };
+          Object.defineProperty(w, '__relayPM', { value: true });
+          w.postMessage = wrapped;
+        } catch (e) {}
+      }
+      relayPatchPostMessage(window);
+
+      try {
+        var relayCwDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+        if (relayCwDesc && relayCwDesc.get) {
+          Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+            get: function() {
+              var w = relayCwDesc.get.call(this);
+              relayPatchPostMessage(w);
+              return w;
+            },
+            configurable: true
+          });
         }
       } catch (e) {}
 
@@ -2262,7 +2325,9 @@ class ScriptInjector {
 
         history.pushState = function(state, title, url) {
           if (url !== undefined && url !== null) {
-            url = toProxied(String(url));
+            var relayOrigPush = String(url);
+            url = toProxied(relayOrigPush);
+            if (RELAY_LOG_NAV) relayLogFailure('PUSH', relayOrigPush, 'NAV', '-> ' + url);
             relayUpdateBaseTag(url);
           }
           return origPushState.call(this, state, title, url);
@@ -2270,7 +2335,9 @@ class ScriptInjector {
 
         history.replaceState = function(state, title, url) {
           if (url !== undefined && url !== null) {
-            url = toProxied(String(url));
+            var relayOrigReplace = String(url);
+            url = toProxied(relayOrigReplace);
+            if (RELAY_LOG_NAV) relayLogFailure('REPLACE', relayOrigReplace, 'NAV', '-> ' + url);
             relayUpdateBaseTag(url);
           }
           return origReplaceState.call(this, state, title, url);
