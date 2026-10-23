@@ -45,6 +45,27 @@
 
 const SW_PATH = '/__proxy_sw.js';
 
+// "Real path" mode (EXPERIMENTAL). Sites whose client-side router reads
+// location.pathname (Next.js, React Router, GitHub's React apps) can't work
+// under a path-embedded scheme: they see "/https://host/page" instead of
+// "/page", fail to match their routes, and crash or leave widgets inert.
+// For these hosts the injected script rewrites the ADDRESS BAR to the real
+// path right after load (relative-URL resolution uses our <base> tag, not the
+// address bar, so loading is unaffected) and remembers the real origin in a
+// short-lived cookie so a reload of the bare path can be routed back.
+// Trade-off: the address bar no longer contains the embedded target. Add or
+// remove hosts here; set to /^$/ to disable the mode entirely.
+const REAL_PATH_HOSTS = /^(www\.)?(bbc\.com|bbc\.co\.uk|github\.com|react\.dev)$/i;
+const CTX_COOKIE = '__relay_ctx';
+
+// A first path segment that looks like a bare domain ("/example.com") is the
+// "typed a domain straight after the relay URL" feature, not a real path.
+function looksLikeBareDomain(pathname) {
+  const seg = pathname.split('/')[1] || '';
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(seg) &&
+    !/\.(ico|txt|html?|js|mjs|css|json|png|jpe?g|gif|svg|webp|xml|map|woff2?|ttf|wasm)$/i.test(seg);
+}
+
 const SW_SCRIPT = `
 // Without these, a newly-deployed version of this script doesn't take over
 // an already-open tab until every tab using the OLD version is closed —
@@ -996,6 +1017,25 @@ export default {
     // page issued the request — and redirect to the corrected URL rather
     // than silently failing or mis-serving it.
     if (!alreadyEmbedded) {
+      // Real-path-mode context (see REAL_PATH_HOSTS): the address bar holds a
+      // bare real path, so Referer can't say which site it belongs to. The
+      // injected script left the real origin in a cookie.
+      let ctxOrigin = null;
+      try {
+        const rawCtx = relayGetCookie(request, CTX_COOKIE);
+        if (rawCtx && /^https?:\/\/[^/\s]+$/i.test(rawCtx)) ctxOrigin = rawCtx;
+      } catch {
+        // ignore malformed cookie
+      }
+      const canUseCtx = !!ctxOrigin && (url.pathname !== '/' || !!url.search) && !looksLikeBareDomain(url.pathname);
+      // A reload / typed address is browser-initiated: its Referer is stale
+      // (whatever page originally linked here), so trust the cookie first.
+      const browserInitiated =
+        request.headers.get('Sec-Fetch-Site') === 'none' && request.headers.get('Sec-Fetch-Mode') === 'navigate';
+      if (canUseCtx && browserInitiated) {
+        return Response.redirect(proxyOrigin + '/' + ctxOrigin + url.pathname + url.search, 302);
+      }
+
       const ref = request.headers.get('Referer');
       if (ref) {
         try {
@@ -1011,6 +1051,11 @@ export default {
         } catch {
           // fall through
         }
+      }
+      // Referer couldn't place it (e.g. the page is in real-path mode, so its
+      // Referer is itself a bare path): fall back to the cookie.
+      if (canUseCtx) {
+        return Response.redirect(proxyOrigin + '/' + ctxOrigin + url.pathname + url.search, 302);
       }
     }
 
@@ -1073,6 +1118,13 @@ export default {
     // its own origin, recursively, on a crafted or accidental link.
     if (parsedTarget.origin === proxyOrigin) {
       return errorResponse(proxyOrigin, 400, 'Refusing to proxy itself', "This address points back at the relay's own origin, which would cause it to fetch itself.", null, parsedTarget.href);
+    }
+
+    // Cloudflare analytics/speculation endpoints on the TARGET's domain (RUM
+    // beacons, Speculation Rules) have no meaning through the relay and only
+    // produce 404/405 noise. Acknowledge and drop them.
+    if (parsedTarget.pathname === '/cdn-cgi/rum' || parsedTarget.pathname === '/cdn-cgi/speculation') {
+      return new Response(null, { status: 204 });
     }
 
     // Edge cache: identical proxied requests skip origin + rewriting entirely.
@@ -1227,6 +1279,15 @@ export default {
     const baseUrl = upstream.url || parsedTarget.href;
     const proxiedBase = proxyOrigin + '/' + baseUrl;
 
+    // Real-path mode: hand the injected script the real path to show.
+    let spoofPath = '';
+    try {
+      const finalForPath = new URL(baseUrl);
+      if (REAL_PATH_HOSTS.test(finalForPath.hostname)) spoofPath = finalForPath.pathname + finalForPath.search;
+    } catch {
+      // leave empty
+    }
+
     const rewriter = new HTMLRewriter()
       .on('meta[name]', new MetaReferrerRewriter())
       .on('meta[http-equiv]', new MetaReferrerRewriter())
@@ -1246,7 +1307,7 @@ export default {
       .on('source[srcset]', new SrcsetRewriter(baseUrl, proxyOrigin))
       .on('meta[http-equiv]', new MetaRefreshRewriter(baseUrl, proxyOrigin))
       .on('head', new BaseTagInjector(proxiedBase))
-      .on('head', new ScriptInjector(proxyOrigin));
+      .on('head', new ScriptInjector(proxyOrigin, spoofPath));
 
     const transformed = rewriter.transform(upstream);
 
@@ -1677,8 +1738,9 @@ class BaseTagInjector {
 }
 
 class ScriptInjector {
-  constructor(proxyOrigin) {
+  constructor(proxyOrigin, realPath) {
     this.proxyOrigin = proxyOrigin;
+    this.realPath = realPath || '';
   }
   element(el) {
     el.prepend(
@@ -1686,6 +1748,9 @@ class ScriptInjector {
     <script>
     (function() {
       var proxyOrigin = '${this.proxyOrigin}';
+      // Real-path mode (see REAL_PATH_HOSTS on the server). Empty = normal mode.
+      var relaySpoofPath = ${JSON.stringify(this.realPath || '').replace(/</g, '\\u003c')};
+      var relaySpoofReal = '';
 
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.register('${SW_PATH}').catch(function() {});
@@ -1717,9 +1782,25 @@ class ScriptInjector {
       function realBase() {
         var prefix = proxyOrigin + '/';
         if (document.baseURI.indexOf(prefix) === 0) {
-          return document.baseURI.slice(prefix.length);
+          var baseRest = document.baseURI.slice(prefix.length);
+          // Real-path mode, before our <base> is parsed: the document URL is a
+          // bare real path, so fall back to the real URL captured at startup.
+          if (relaySpoofReal && !/^https?:\\/\\//i.test(baseRest)) return relaySpoofReal;
+          return baseRest;
         }
         return document.baseURI;
+      }
+
+      if (relaySpoofPath) {
+        try {
+          // Capture the real URL BEFORE changing the address bar.
+          relaySpoofReal = realBase();
+          history.replaceState(history.state, '', relaySpoofPath + location.hash);
+          document.cookie = '__relay_ctx=' + encodeURIComponent(new URL(relaySpoofReal).origin) +
+            '; path=/; max-age=86400; samesite=lax; secure';
+        } catch (e) {
+          relaySpoofPath = '';
+        }
       }
 
       // Mirrors decodeTrackingRedirect on the server side (same three
@@ -2319,6 +2400,18 @@ class ScriptInjector {
       // Wrapped for the same reason as the postMessage patch above: a throw
       // here must not be able to silently disable everything registered
       // after it, especially the click/submit interceptors.
+      // In real-path mode the address bar must keep showing real paths, so the
+      // proxied URL is used only for <base>; the history entry gets the real
+      // path. Cross-origin or unparseable URLs fall back to the proxied form.
+      function relayAddressUrl(proxiedUrl) {
+        if (!relaySpoofPath) return proxiedUrl;
+        try {
+          var ru = new URL(fromProxied(proxiedUrl));
+          if (ru.origin === new URL(relaySpoofReal).origin) return ru.pathname + ru.search + ru.hash;
+        } catch (e) {}
+        return proxiedUrl;
+      }
+
       try {
         var origPushState = history.pushState;
         var origReplaceState = history.replaceState;
@@ -2328,7 +2421,9 @@ class ScriptInjector {
             var relayOrigPush = String(url);
             url = toProxied(relayOrigPush);
             if (RELAY_LOG_NAV) relayLogFailure('PUSH', relayOrigPush, 'NAV', '-> ' + url);
+            var relayAddrPush = relayAddressUrl(url);
             relayUpdateBaseTag(url);
+            url = relayAddrPush;
           }
           return origPushState.call(this, state, title, url);
         };
@@ -2338,7 +2433,9 @@ class ScriptInjector {
             var relayOrigReplace = String(url);
             url = toProxied(relayOrigReplace);
             if (RELAY_LOG_NAV) relayLogFailure('REPLACE', relayOrigReplace, 'NAV', '-> ' + url);
+            var relayAddrReplace = relayAddressUrl(url);
             relayUpdateBaseTag(url);
+            url = relayAddrReplace;
           }
           return origReplaceState.call(this, state, title, url);
         };
@@ -2347,6 +2444,13 @@ class ScriptInjector {
       // Back/forward navigation between pushState entries restores the URL
       // without a network request either — keep <base> in sync there too.
       window.addEventListener('popstate', function() {
+        if (relaySpoofPath) {
+          try {
+            relayUpdateBaseTag(proxyOrigin + '/' + new URL(relaySpoofReal).origin +
+              location.pathname + location.search);
+          } catch (e) {}
+          return;
+        }
         relayUpdateBaseTag(location.href);
       });
 
