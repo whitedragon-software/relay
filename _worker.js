@@ -1947,6 +1947,15 @@ class ScriptInjector {
         };
       } catch (e) {}
 
+      // In real-path mode the address bar has lost the host, so keep the
+      // relay button visible from the start (it normally appears only after
+      // the first failure) so the real URL / a working link is one tap away.
+      if (relaySpoofPath) {
+        document.addEventListener('DOMContentLoaded', function() {
+          try { relayEnsurePanel(); } catch (e) {}
+        });
+      }
+
       // Same treatment for the DOM *properties* (el.href = ...), which are a
       // separate code path from setAttribute — frameworks use one or the
       // other, so both need covering.
@@ -1974,6 +1983,18 @@ class ScriptInjector {
           })(relayPropList[relayPi][0], relayPropList[relayPi][1]);
         }
       } catch (e) {}
+
+      // The real URL of the current page. In real-path mode the address bar
+      // shows only a bare path, so the panel surfaces the full real URL and
+      // can copy a working relay link for it.
+      function relayCurrentRealUrl() {
+        try {
+          if (relaySpoofPath) return new URL(relaySpoofReal).origin + location.pathname + location.search + location.hash;
+          return fromProxied(location.href);
+        } catch (e) {
+          return location.href;
+        }
+      }
 
       // --- Diagnostic overlay -------------------------------------------
       // Failed requests (non-2xx, network errors, failed resource loads,
@@ -2028,6 +2049,8 @@ class ScriptInjector {
           'padding:6px 8px;background:#1a1a1a;border-bottom:1px solid #333;position:sticky;top:0;">' +
           '<span style="color:#ccc;">relay B14-PANEL \u2014 failed requests</span>' +
           '<span style="display:flex;gap:10px;align-items:center;">' +
+          '<button id="__relay_debug_link" title="Copy a relay link to this page" style="background:none;border:1px solid #444;' +
+          'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:2px 6px;">Link</button>' +
           '<button id="__relay_debug_copy" style="background:none;border:1px solid #444;' +
           'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:2px 6px;">Copy</button>' +
           '<button id="__relay_debug_close" style="background:none;border:0;color:#888;' +
@@ -2053,6 +2076,16 @@ class ScriptInjector {
         document.getElementById('__relay_debug_close').addEventListener('click', function() {
           panel.style.display = 'none';
         });
+        document.getElementById('__relay_debug_link').addEventListener('click', function() {
+          var lbtn = document.getElementById('__relay_debug_link');
+          function ldone(ok) { lbtn.textContent = ok ? 'Copied!' : 'Copy failed'; setTimeout(function() { lbtn.textContent = 'Link'; }, 1500); }
+          var link = proxyOrigin + '/' + relayCurrentRealUrl();
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(link).then(function() { ldone(true); }, function() { ldone(false); });
+          } else {
+            ldone(false);
+          }
+        });
         document.getElementById('__relay_debug_copy').addEventListener('click', function() {
           var btn = document.getElementById('__relay_debug_copy');
           var text = __relayFailures.map(function(r) {
@@ -2071,7 +2104,8 @@ class ScriptInjector {
         try {
           var list = document.getElementById('__relay_debug_list');
           if (!list) return;
-          list.innerHTML = __relayFailures.map(function(r) {
+          list.innerHTML = '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#8fb4ff;' +
+            'word-break:break-all;">page: ' + relayEsc(relayCurrentRealUrl()) + '</div>' + __relayFailures.map(function(r) {
             return '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#eee;' +
               'word-break:break-all;"><b style="color:#ff8a63;">' + relayEsc(r.status) + '</b> ' +
               relayEsc(r.method) + ' ' + relayEsc(r.url) + (r.note ? ' \u2014 ' + relayEsc(r.note) : '') + '</div>';
