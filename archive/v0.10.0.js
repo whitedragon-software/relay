@@ -57,6 +57,47 @@ const SW_PATH = '/__proxy_sw.js';
 // remove hosts here; set to /^$/ to disable the mode entirely.
 const REAL_PATH_HOSTS = /^(www\.)?(bbc\.com|bbc\.co\.uk|github\.com|react\.dev)$/i;
 const CTX_COOKIE = '__relay_ctx';
+const DEBUG_PATH = '/__relay_debug';
+
+// Real origin of a real-path-mode page, from the cookie its injected script
+// sets (null when absent or malformed).
+function getCtxOrigin(request) {
+  try {
+    const raw = relayGetCookie(request, CTX_COOKIE);
+    if (raw && /^https?:\/\/[^/\s]+$/i.test(raw)) return raw;
+  } catch {
+    // ignore malformed cookie
+  }
+  return null;
+}
+
+// What the visiting page's real URL/origin is, as best the request can say.
+// Normal pages: the Referer is embedded (relay/https://site/page), so recover
+// it. Real-path-mode pages: the Referer is a bare relay path (relay/news), so
+// pair it with the real origin from the cookie. Used to restore Referer and
+// Origin upstream (hotlink-protected media CDNs check them) and to repair
+// URLs the page put in a query string.
+function resolvePageContext(request, proxyOrigin) {
+  const ref = request.headers.get('Referer');
+  const real = recoverRealUrl(ref, proxyOrigin);
+  if (real) {
+    try {
+      return { referer: real, origin: new URL(real).origin };
+    } catch {
+      // fall through
+    }
+  }
+  const ctx = getCtxOrigin(request);
+  if (ctx && ref) {
+    try {
+      const r = new URL(ref);
+      if (r.origin === proxyOrigin) return { referer: ctx + r.pathname + r.search, origin: ctx };
+    } catch {
+      // fall through
+    }
+  }
+  return { referer: null, origin: null };
+}
 
 // A first path segment that looks like a bare domain ("/example.com") is the
 // "typed a domain straight after the relay URL" feature, not a real path.
@@ -986,6 +1027,30 @@ export default {
       });
     }
 
+    // Debug mode switch: visit /__relay_debug to turn the injected script's
+    // verbose diagnostics on for 24 h (cookie), /__relay_debug?on=0 to turn
+    // them off. Meant for phones, where editing the worker for a flag is a pain.
+    if (url.pathname === DEBUG_PATH) {
+      const on = url.searchParams.get('on') !== '0';
+      return new Response(
+        '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">' +
+        '<title>Relay debug</title><body style="font:16px system-ui;padding:24px;max-width:480px">' +
+        '<h2>Relay debug mode: ' + (on ? 'ON' : 'OFF') + '</h2>' +
+        (on
+          ? '<p>Verbose diagnostics are on for 24 hours: navigation events, clicks with no link, and a log that survives page jumps.</p><p><a href="' + DEBUG_PATH + '?on=0">Turn off</a></p>'
+          : '<p><a href="' + DEBUG_PATH + '">Turn on</a></p>') +
+        '<p><a href="/">Back to relay</a></p>',
+        {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Set-Cookie': '__relay_debug=' + (on ? '1' : '') + '; Path=/; Max-Age=' + (on ? 86400 : 0) + '; Secure; SameSite=Lax',
+            'Cache-Control': 'no-store'
+          }
+        }
+      );
+    }
+
     // Some client code (Next.js's router does this) collapses "//" in paths:
     // /https://host/x becomes /https:/host/x. Restore it before anything
     // else treats it as a root-relative reference.
@@ -1147,6 +1212,11 @@ export default {
       if (cached) return cached;
     }
 
+    // Range requests and HLS/DASH manifests must not go through the blanket
+    // edge cache: a cached live playlist is stale within seconds (live video
+    // stalls), and caching a partial-content request is wrong.
+    const noEdgeCache = request.headers.has('Range') || /\.(m3u8|mpd)$/i.test(parsedTarget.pathname);
+
     const upstreamInit = {
       method: request.method,
       headers: buildUpstreamHeaders(request, proxyOrigin, parsedTarget.origin),
@@ -1161,7 +1231,7 @@ export default {
       // replayed from Cloudflare's cache to every visitor for the full
       // TTL. 1s on the error ranges is effectively "don't cache" without
       // relying on 0-TTL handling.
-      cf: { cacheEverything: true, cacheTtlByStatus: { '200-299': 120, '400-499': 1, '500-599': 1 } }
+      cf: noEdgeCache ? undefined : { cacheEverything: true, cacheTtlByStatus: { '200-299': 120, '400-499': 1, '500-599': 1 } }
     };
     // Forward the real request body for non-GET/HEAD methods — previously
     // every upstream fetch was an implicit GET regardless of the incoming
@@ -1172,7 +1242,7 @@ export default {
       upstreamInit.duplex = 'half';
     }
 
-    const upstreamHref = stripProxyFromQuery(parsedTarget, proxyOrigin);
+    const upstreamHref = stripProxyFromQuery(parsedTarget, proxyOrigin, resolvePageContext(request, proxyOrigin).origin);
 
     let upstream;
     try {
@@ -1334,12 +1404,24 @@ function proxify(absoluteUrl, proxyOrigin) {
 // server validates that against its registered domains and rejects the
 // relay-wrapped form (400), so unwrap it back to the real URL before
 // forwarding. Query string only; everything else is untouched.
-function stripProxyFromQuery(parsed, proxyOrigin) {
+function stripProxyFromQuery(parsed, proxyOrigin, pageOrigin) {
   if (!parsed.search) return parsed.href;
-  const encoded = encodeURIComponent(proxyOrigin + '/');
-  const encodedLower = encoded.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
-  let search = parsed.search.split(encoded).join('').split(encodedLower).join('');
-  search = search.split(proxyOrigin + '/').join('');
+  const esc = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const lowerHex = (v) => v.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
+  const encWrapped = encodeURIComponent(proxyOrigin + '/');
+  const encOrigin = encodeURIComponent(proxyOrigin);
+  let search = parsed.search;
+  // 1. A relay wrapper in front of an embedded real URL: drop the wrapper.
+  for (const w of [encWrapped, lowerHex(encWrapped), proxyOrigin + '/']) {
+    search = search.replace(new RegExp(esc(w) + '(?=https?(?::|%3[Aa]))', 'g'), '');
+  }
+  // 2. Any relay origin left over means the page's URL was a bare real path
+  //    (real-path mode): swap it for the page's real origin.
+  if (pageOrigin) {
+    search = search.split(encOrigin).join(encodeURIComponent(pageOrigin));
+    search = search.split(lowerHex(encOrigin)).join(encodeURIComponent(pageOrigin));
+    search = search.split(proxyOrigin).join(pageOrigin);
+  }
   if (search === parsed.search) return parsed.href;
   const u = new URL(parsed.href);
   u.search = search;
@@ -1401,11 +1483,15 @@ function buildUpstreamHeaders(request, proxyOrigin, targetOrigin) {
   // its content. Origin never carries a path (just scheme+host) — there's
   // nothing to recover from it, so when the browser sent one at all, set it
   // to the request's own known real target origin instead.
-  const realReferer = recoverRealUrl(request.headers.get('Referer'), proxyOrigin);
-  if (realReferer) headers.set('Referer', realReferer);
+  // The page's real URL/origin (embedded Referer, or cookie for real-path
+  // pages). A browser sends the PAGE's origin on cross-origin requests, which
+  // media CDNs and CORS allow-lists check; fall back to the target's own
+  // origin only when the page can't be determined.
+  const pageCtx = resolvePageContext(request, proxyOrigin);
+  if (pageCtx.referer) headers.set('Referer', pageCtx.referer);
 
   if (request.headers.get('Origin')) {
-    headers.set('Origin', targetOrigin);
+    headers.set('Origin', pageCtx.origin || targetOrigin);
   }
 
   return headers;
@@ -1950,11 +2036,16 @@ class ScriptInjector {
       // In real-path mode the address bar has lost the host, so keep the
       // relay button visible from the start (it normally appears only after
       // the first failure) so the real URL / a working link is one tap away.
-      if (relaySpoofPath) {
-        document.addEventListener('DOMContentLoaded', function() {
-          try { relayEnsurePanel(); } catch (e) {}
-        });
-      }
+      // (RELAY_DEBUG is assigned further down, so the check happens when the
+      // event fires, not when this listener is registered.)
+      document.addEventListener('DOMContentLoaded', function() {
+        if (!(relaySpoofPath || RELAY_DEBUG)) return;
+        try {
+          relayEnsurePanel();
+          var relayTg = document.getElementById('__relay_debug_toggle');
+          if (relayTg && RELAY_DEBUG && __relayHist.length) relayTg.textContent = 'relay \u00b7 ' + __relayHist.length;
+        } catch (e) {}
+      });
 
       // Same treatment for the DOM *properties* (el.href = ...), which are a
       // separate code path from setAttribute — frameworks use one or the
@@ -2010,10 +2101,27 @@ class ScriptInjector {
       // NO_LINK entries just record clicks on non-anchor elements (buttons,
       // divs, spans). They are not failures. Flip to true only when hunting
       // for link-less navigation that escapes the proxy.
-      var RELAY_LOG_NO_LINK = false;
+      // Debug mode is switched on by visiting /__relay_debug on the relay (a
+      // 24 h cookie), so it can be enabled from a phone without editing this
+      // file. It turns on NO_LINK and NAV logging, adds Navigation-API events,
+      // and keeps a log in sessionStorage that survives page jumps.
+      var RELAY_DEBUG = /(?:^|;\\s*)__relay_debug=1/.test(document.cookie);
+      var RELAY_LOG_NO_LINK = RELAY_DEBUG;
+      var __relayHist = [];
+      if (RELAY_DEBUG) {
+        try { __relayHist = JSON.parse(sessionStorage.getItem('__relay_hist') || '[]'); } catch (e) { __relayHist = []; }
+      }
+      function relayHistPush(entry) {
+        try {
+          __relayHist.unshift(entry);
+          if (__relayHist.length > 60) __relayHist.length = 60;
+          sessionStorage.setItem('__relay_hist', JSON.stringify(__relayHist));
+        } catch (e) {}
+      }
+      function relayRows() { return RELAY_DEBUG ? __relayHist : __relayFailures; }
       // Logs every history.pushState/replaceState call (original -> proxied).
       // Turn on to see exactly which URL page JS handed the router.
-      var RELAY_LOG_NAV = false;
+      var RELAY_LOG_NAV = RELAY_DEBUG;
 
       // Single escape point for the debug panel: rows interpolate strings
       // that are page-controlled (fetch/XHR input URLs) or target-server-
@@ -2088,7 +2196,7 @@ class ScriptInjector {
         });
         document.getElementById('__relay_debug_copy').addEventListener('click', function() {
           var btn = document.getElementById('__relay_debug_copy');
-          var text = __relayFailures.map(function(r) {
+          var text = relayRows().map(function(r) {
             return r.status + ' ' + r.method + ' ' + r.url + (r.note ? ' - ' + r.note : '');
           }).join('\\n');
           function done(ok) { btn.textContent = ok ? 'Copied!' : 'Copy failed'; setTimeout(function() { btn.textContent = 'Copy'; }, 1500); }
@@ -2105,10 +2213,12 @@ class ScriptInjector {
           var list = document.getElementById('__relay_debug_list');
           if (!list) return;
           list.innerHTML = '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#8fb4ff;' +
-            'word-break:break-all;">page: ' + relayEsc(relayCurrentRealUrl()) + '</div>' + __relayFailures.map(function(r) {
+            'word-break:break-all;">page: ' + relayEsc(relayCurrentRealUrl()) + '</div>' + relayRows().map(function(r) {
             return '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#eee;' +
-              'word-break:break-all;"><b style="color:#ff8a63;">' + relayEsc(r.status) + '</b> ' +
-              relayEsc(r.method) + ' ' + relayEsc(r.url) + (r.note ? ' \u2014 ' + relayEsc(r.note) : '') + '</div>';
+              'word-break:break-all;">' + (r.t ? '<span style="color:#789;">' + relayEsc(r.t) + '</span> ' : '') +
+              '<b style="color:#ff8a63;">' + relayEsc(r.status) + '</b> ' +
+              relayEsc(r.method) + ' ' + relayEsc(r.url) + (r.note ? ' \u2014 ' + relayEsc(r.note) : '') +
+              (r.page ? '<div style="color:#789;">@ ' + relayEsc(r.page) + '</div>' : '') + '</div>';
           }).join('');
         } catch (e) {}
       }
@@ -2122,11 +2232,16 @@ class ScriptInjector {
           relayEnsurePanel();
           __relayFailures.unshift({ method: method, url: realUrl, status: status, note: note || '' });
           if (__relayFailures.length > MAX_LOGGED) __relayFailures.pop();
+          if (RELAY_DEBUG) {
+            relayHistPush({ t: new Date().toTimeString().slice(0, 8), page: relayCurrentRealUrl(),
+              method: method, url: realUrl, status: status, note: note || '' });
+          }
           // Update the collapsed button's count badge; the panel itself
           // only re-renders if the user has it open.
           var toggle = document.getElementById('__relay_debug_toggle');
           if (toggle) {
-            toggle.textContent = __relayFailures.length ? 'relay \u00b7 ' + __relayFailures.length : 'relay';
+            var relayRowCount = relayRows().length;
+            toggle.textContent = relayRowCount ? 'relay \u00b7 ' + relayRowCount : 'relay';
           }
           var panel = document.getElementById('__relay_debug_panel');
           if (panel && panel.style.display !== 'none') relayRenderList();
@@ -2154,6 +2269,29 @@ class ScriptInjector {
         relayLogFailure(tag, src, 'LOAD_ERR', 'failed to load');
       }, true);
       // ---------------------------------------------------------------
+
+      // Debug mode: record EVERY navigation, including location.href = ...
+      // assignments that no script can intercept, via the Navigation API
+      // (Chromium; absent in some Safari versions), and note page unloads in
+      // the persisted log so a jump back to a home page can be traced.
+      if (RELAY_LOG_NAV) {
+        try {
+          if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+            window.navigation.addEventListener('navigate', function(e) {
+              try {
+                relayLogFailure('NAVIGATE', e.destination.url, e.navigationType,
+                  e.sameDocument ? 'same-document' : 'new document');
+              } catch (x) {}
+            });
+          }
+          window.addEventListener('pagehide', function() {
+            try {
+              relayHistPush({ t: new Date().toTimeString().slice(0, 8), page: relayCurrentRealUrl(),
+                method: 'PAGEHIDE', url: '-', status: 'UNLOAD', note: 'document unloading' });
+            } catch (x) {}
+          });
+        } catch (e) {}
+      }
 
       // Rebuilds a Request object against the proxied URL. The body is
       // BUFFERED rather than re-streamed: a streamed upload needs HTTP/2
@@ -2211,7 +2349,20 @@ class ScriptInjector {
           return prepared.then(function(p) {
             return origFetch.call(self, p, init);
           }).then(function(res) {
-            if (!res.ok) relayLogFailure(method, originalForLog, res.status);
+            if (!res.ok) {
+              if (RELAY_DEBUG) {
+                // Debug mode: include the start of the response body. Anti-bot
+                // endpoints explain themselves there (a 418 with a challenge
+                // type, a rate-limit code, ...).
+                try {
+                  res.clone().text().then(function(t) {
+                    relayLogFailure(method, originalForLog, res.status, t.slice(0, 200));
+                  }, function() { relayLogFailure(method, originalForLog, res.status); });
+                } catch (e) { relayLogFailure(method, originalForLog, res.status); }
+              } else {
+                relayLogFailure(method, originalForLog, res.status);
+              }
+            }
             return res;
           }, function(err) {
             relayLogFailure(method, originalForLog, 'ERR', err && err.message);
@@ -2236,7 +2387,13 @@ class ScriptInjector {
           var xhr = this;
           xhr.addEventListener('loadend', function() {
             if (xhr.status === 0 || xhr.status >= 400) {
-              relayLogFailure(xhr.__relayMethod || '?', xhr.__relayUrl || '?', xhr.status || 'ERR');
+              var xhrNote = '';
+              if (RELAY_DEBUG) {
+                try {
+                  if (!xhr.responseType || xhr.responseType === 'text') xhrNote = String(xhr.responseText || '').slice(0, 200);
+                } catch (e) {}
+              }
+              relayLogFailure(xhr.__relayMethod || '?', xhr.__relayUrl || '?', xhr.status || 'ERR', xhrNote);
             }
           });
           return origSend.apply(this, arguments);
@@ -2737,4 +2894,4 @@ class ScriptInjector {
       { html: true }
     );
   }
-}
+        }
