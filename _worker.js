@@ -371,7 +371,7 @@ const HOME_HTML = `<!doctype html>
 
     <footer>
       <span id="originLabel"></span>
-      <span>build B14-PANEL · path-embedded __RELAY_LOGOUT_LINK__</span>
+      <span>build v0.10.0 · path-embedded __RELAY_LOGOUT_LINK__</span>
     </footer>
   </div>
 
@@ -2047,7 +2047,7 @@ class ScriptInjector {
         panel.innerHTML =
           '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;' +
           'padding:6px 8px;background:#1a1a1a;border-bottom:1px solid #333;position:sticky;top:0;">' +
-          '<span style="color:#ccc;">relay B14-PANEL \u2014 failed requests</span>' +
+          '<span style="color:#ccc;">relay v0.10.0 \u2014 failed requests</span>' +
           '<span style="display:flex;gap:10px;align-items:center;">' +
           '<button id="__relay_debug_link" title="Copy a relay link to this page" style="background:none;border:1px solid #444;' +
           'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:2px 6px;">Link</button>' +
@@ -2737,4 +2737,4 @@ class ScriptInjector {
       { html: true }
     );
   }
-}
+      }
