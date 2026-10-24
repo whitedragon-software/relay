@@ -58,6 +58,437 @@ const SW_PATH = '/__proxy_sw.js';
 const REAL_PATH_HOSTS = /^(www\.)?(bbc\.com|bbc\.co\.uk|github\.com|react\.dev)$/i;
 const CTX_COOKIE = '__relay_ctx';
 const DEBUG_PATH = '/__relay_debug';
+const COOKIES_PATH = '/cookies';
+
+// ---- Cookie jar -------------------------------------------------------------
+// Per-site cookies, so logins and sessions work. The Worker has no storage of
+// its own, so the jar lives in the VISITOR'S BROWSER as cookies on the relay's
+// origin, one jar cookie per (target host, visibility):
+//
+//   __rj_h_<base64url host>   HttpOnly  - cookies the target marked HttpOnly
+//   __rj_s_<base64url host>   readable  - the rest; document.cookie in the
+//                                         injected script is a shim over these
+//
+// A jar cookie's value is base64url(JSON) of records
+//   [name, value, path, expiresMs (0 = session), secure, hostOnly, sameSite]
+// where sameSite is 0 None, 1 Lax (also the default), 2 Strict. The jar is
+// keyed by the Domain attribute (or the exact host for host-only cookies), so
+// a request to a.example.com finds jars for a.example.com, example.com, ...
+// On each request the Worker turns the matching records into an ordinary
+// Cookie header for the target; each upstream Set-Cookie (including the ones
+// on redirect hops, which are followed manually) is folded back into the jar.
+// Requests that carry jar cookies are personalized and bypass every cache.
+// Set COOKIE_JAR to false to restore the old anonymous behavior exactly.
+const COOKIE_JAR = true;
+const JAR_PREFIX = '__rj_';
+const JAR_MAX_B64 = 3000;          // per jar cookie (browsers cap a cookie near 4 KB)
+const JAR_BUDGET = 9000;           // all jar cookies together; keeps the Cookie header small
+const JAR_MAX_HOPS = 10;
+const JAR_MAX_AGE_MS = 400 * 24 * 3600 * 1000;
+// There is no public-suffix list in a single-file Worker; these multi-label
+// suffixes are the common ones, so a site cannot set a cookie for "co.uk".
+const TWO_LEVEL_SUFFIXES = new Set([
+  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk', 'com.au', 'net.au', 'org.au', 'edu.au',
+  'co.jp', 'or.jp', 'ne.jp', 'co.nz', 'org.nz', 'co.in', 'net.in', 'org.in', 'co.kr',
+  'com.br', 'com.cn', 'com.mx', 'com.tr', 'com.sg', 'com.hk', 'com.tw', 'com.ar',
+  'co.za', 'co.id', 'co.il', 'com.my', 'com.ph', 'com.vn', 'com.ua', 'com.pl'
+]);
+
+function b64uEnc(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64uDec(b) {
+  try {
+    let t = String(b).replace(/-/g, '+').replace(/_/g, '/');
+    while (t.length % 4) t += '=';
+    const bin = atob(t);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function parseCookieHeader(header) {
+  const out = [];
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const i = part.indexOf('=');
+    if (i <= 0) continue;
+    out.push([part.slice(0, i).trim(), part.slice(i + 1).trim()]);
+  }
+  return out;
+}
+
+function isPublicSuffix(domain) {
+  return !domain.includes('.') || TWO_LEVEL_SUFFIXES.has(domain);
+}
+
+// Approximate "site" (registrable domain) for SameSite decisions.
+function siteOf(host) {
+  host = String(host || '').toLowerCase();
+  if (/^[\d.]+$/.test(host) || host.includes(':')) return host;
+  const labels = host.split('.');
+  if (labels.length <= 2) return host;
+  const last2 = labels.slice(-2).join('.');
+  return TWO_LEVEL_SUFFIXES.has(last2) ? labels.slice(-3).join('.') : last2;
+}
+
+function jarPathMatch(reqPath, cookiePath) {
+  if (reqPath === cookiePath) return true;
+  if (!reqPath.startsWith(cookiePath)) return false;
+  return cookiePath.endsWith('/') || reqPath.charAt(cookiePath.length) === '/';
+}
+
+function jarCookieName(kind, host) {
+  return JAR_PREFIX + kind + '_' + b64uEnc(host);
+}
+
+function jarExpireHeader(name) {
+  return name + '=; Path=/; Max-Age=0; Secure; SameSite=Lax';
+}
+
+function loadJar(request) {
+  const jar = { entries: new Map(), raw: new Map(), dirty: new Set() };
+  for (const [name, value] of parseCookieHeader(request.headers.get('Cookie'))) {
+    if (!name.startsWith(JAR_PREFIX) || name.length <= 7 || name.charAt(6) !== '_') continue;
+    const kind = name.charAt(5);
+    if (kind !== 'h' && kind !== 's') continue;
+    jar.raw.set(name, name.length + value.length + 3);
+    const host = b64uDec(name.slice(7));
+    const json = b64uDec(value);
+    if (!host || !json) continue;
+    let records;
+    try {
+      records = JSON.parse(json);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(records)) continue;
+    records = records.filter((r) =>
+      Array.isArray(r) && r.length >= 7 && typeof r[0] === 'string' && typeof r[1] === 'string' && typeof r[2] === 'string');
+    jar.entries.set(kind + '\n' + host, { kind, host, records });
+  }
+  return jar;
+}
+
+// The Cookie header for one request to `target` (a URL).
+function jarCookieHeader(jar, target, crossSite, topLevelNav) {
+  const host = target.hostname.toLowerCase();
+  const path = target.pathname || '/';
+  const https = target.protocol === 'https:';
+  const now = Date.now();
+  const picked = [];
+  for (const e of jar.entries.values()) {
+    if (!(host === e.host || host.endsWith('.' + e.host))) continue;
+    if (e.host !== host && isPublicSuffix(e.host)) continue;     // never a jar for "co.uk" / "com"
+    for (const r of e.records) {
+      if (r[3] && r[3] <= now) continue;          // expired
+      if (r[5] && host !== e.host) continue;       // host-only
+      if (r[4] && !https) continue;                // Secure
+      if (!jarPathMatch(path, r[2])) continue;
+      if (crossSite) {
+        // A cross-site request carries only SameSite=None cookies, plus Lax
+        // ones on a top-level navigation - as a browser would.
+        if (r[6] === 2) continue;
+        if (r[6] === 1 && !topLevelNav) continue;
+      }
+      picked.push(r);
+    }
+  }
+  picked.sort((a, b) => b[2].length - a[2].length);
+  return picked.map((r) => r[0] + '=' + r[1]).join('; ');
+}
+
+// One Set-Cookie line -> a normalized cookie, or null if a browser would reject it.
+function parseSetCookie(line, target, now) {
+  const parts = String(line).split(';');
+  const first = parts.shift() || '';
+  const eq = first.indexOf('=');
+  if (eq <= 0) return null;
+  const name = first.slice(0, eq).trim();
+  const value = first.slice(eq + 1).trim();
+  if (!name) return null;
+  let domain = '';
+  let path = '';
+  let maxAge = null;
+  let expires = null;
+  let secure = false;
+  let httpOnly = false;
+  let sameSite = 1;
+  for (const p of parts) {
+    const i = p.indexOf('=');
+    const k = (i < 0 ? p : p.slice(0, i)).trim().toLowerCase();
+    const v = i < 0 ? '' : p.slice(i + 1).trim();
+    if (k === 'domain') domain = v;
+    else if (k === 'path') path = v;
+    else if (k === 'max-age') { const n = parseInt(v, 10); if (!Number.isNaN(n)) maxAge = n; }
+    else if (k === 'expires') expires = v;
+    else if (k === 'secure') secure = true;
+    else if (k === 'httponly') httpOnly = true;
+    else if (k === 'samesite') { const sv = v.toLowerCase(); sameSite = sv === 'none' ? 0 : sv === 'strict' ? 2 : 1; }
+  }
+  const host = target.hostname.toLowerCase();
+  let key = host;
+  let hostOnly = true;
+  if (domain) {
+    const d = domain.replace(/^\./, '').toLowerCase();
+    if (!(host === d || host.endsWith('.' + d))) return null;
+    if (isPublicSuffix(d) && d !== host) return null;
+    key = d;
+    hostOnly = false;
+  }
+  if (!path || path.charAt(0) !== '/') {
+    const pp = target.pathname || '/';
+    const idx = pp.lastIndexOf('/');
+    path = idx <= 0 ? '/' : pp.slice(0, idx);
+  }
+  if (secure && target.protocol !== 'https:') return null;
+  if (name.startsWith('__Secure-') && !secure) return null;
+  if (name.startsWith('__Host-') && !(secure && path === '/' && hostOnly)) return null;
+  let del = false;
+  let exp = 0;
+  if (maxAge !== null) {
+    if (maxAge <= 0) del = true;
+    else exp = now + Math.min(maxAge * 1000, JAR_MAX_AGE_MS);
+  } else if (expires) {
+    const t = Date.parse(expires);
+    if (!Number.isNaN(t)) {
+      if (t <= now) del = true;
+      else exp = Math.min(t, now + JAR_MAX_AGE_MS);
+    }
+  }
+  return { name, value, path, key, hostOnly, secure, httpOnly, sameSite, exp, del };
+}
+
+// Several Set-Cookie headers, however the runtime exposes them.
+function getSetCookies(headers) {
+  try {
+    if (typeof headers.getSetCookie === 'function') return headers.getSetCookie();
+    if (typeof headers.getAll === 'function') return headers.getAll('Set-Cookie');
+  } catch {
+    // fall through
+  }
+  const raw = headers.get('Set-Cookie');
+  return raw ? raw.split(/,(?=\s*[^;,=\s]+=)/) : [];
+}
+
+function jarEntry(jar, kind, host, create) {
+  const k = kind + '\n' + host;
+  let e = jar.entries.get(k);
+  if (!e && create) {
+    e = { kind, host, records: [] };
+    jar.entries.set(k, e);
+  }
+  return e;
+}
+
+function jarRemove(jar, kind, host, name, path) {
+  const e = jarEntry(jar, kind, host, false);
+  if (!e) return;
+  const before = e.records.length;
+  e.records = e.records.filter((r) => !(r[0] === name && r[2] === path));
+  if (e.records.length !== before) jar.dirty.add(kind + '\n' + host);
+}
+
+function storeSetCookies(jar, target, lines) {
+  const now = Date.now();
+  for (const line of lines) {
+    const c = parseSetCookie(line, target, now);
+    if (!c) continue;
+    const kind = c.httpOnly ? 'h' : 's';
+    jarRemove(jar, kind === 'h' ? 's' : 'h', c.key, c.name, c.path);
+    jarRemove(jar, kind, c.key, c.name, c.path);
+    if (c.del) continue;
+    const e = jarEntry(jar, kind, c.key, true);
+    e.records.push([c.name, c.value, c.path, c.exp, c.secure ? 1 : 0, c.hostOnly ? 1 : 0, c.sameSite]);
+    jar.dirty.add(kind + '\n' + c.key);
+  }
+}
+
+// Set-Cookie lines that bring the browser's jar cookies up to date. Also keeps
+// the total jar size inside JAR_BUDGET by expiring the largest untouched jars,
+// so a long browsing history can never bloat the Cookie header past what
+// Cloudflare accepts (which would lock the visitor out of the relay).
+function jarSetCookieHeaders(jar) {
+  const out = [];
+  const now = Date.now();
+  const sizes = new Map(jar.raw);
+  const touched = new Set();
+  for (const k of jar.dirty) {
+    const e = jar.entries.get(k);
+    if (!e) continue;
+    const name = jarCookieName(e.kind, e.host);
+    touched.add(name);
+    e.records = e.records.filter((r) => !(r[3] && r[3] <= now));
+    let value = '';
+    while (e.records.length) {
+      value = b64uEnc(JSON.stringify(e.records));
+      if (value.length <= JAR_MAX_B64) break;
+      e.records.shift();           // oldest first
+      value = '';
+    }
+    if (!e.records.length || !value) {
+      out.push(jarExpireHeader(name));
+      sizes.delete(name);
+      continue;
+    }
+    let maxExp = 0;
+    for (const r of e.records) if (r[3] && r[3] > maxExp) maxExp = r[3];
+    let attrs = '; Path=/; Secure; SameSite=Lax' + (e.kind === 'h' ? '; HttpOnly' : '');
+    if (maxExp) attrs += '; Max-Age=' + Math.max(1, Math.floor((maxExp - now) / 1000));
+    out.push(name + '=' + value + attrs);
+    sizes.set(name, name.length + value.length + 3);
+  }
+  let total = 0;
+  for (const n of sizes.values()) total += n;
+  if (total > JAR_BUDGET) {
+    const victims = [...sizes.entries()].filter(([n]) => !touched.has(n)).sort((a, b) => b[1] - a[1]);
+    for (const [n, sz] of victims) {
+      if (total <= JAR_BUDGET) break;
+      out.push(jarExpireHeader(n));
+      total -= sz;
+    }
+  }
+  return out;
+}
+
+function withJarCookies(headers, setCookies) {
+  headers.delete('Set-Cookie');
+  for (const c of setCookies) headers.append('Set-Cookie', c);
+}
+
+function rebuildWithJarCookies(response, setCookies) {
+  const headers = new Headers(response.headers);
+  withJarCookies(headers, setCookies);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+// Follows redirects by hand so cookies set on a redirect hop are kept and the
+// right cookies go out on the next hop (login flows are usually
+// POST -> 302 + Set-Cookie -> page). Returns { response, unreplayable }:
+// unreplayable means a 307/308 whose streamed request body cannot be re-sent,
+// so the redirect response itself is handed back for the browser to follow.
+// `url` is the URL of the hop that produced `response`.
+async function fetchWithJar(startUrl, init, jar, jarCtx) {
+  let url = startUrl;
+  let cur = Object.assign({}, init, { redirect: 'manual' });
+  for (let hop = 0; ; hop++) {
+    const target = new URL(url);
+    const crossSite = !!jarCtx.pageSite && siteOf(target.hostname) !== jarCtx.pageSite;
+    const headers = new Headers(cur.headers);
+    const cookieHeader = jarCookieHeader(jar, target, crossSite, jarCtx.topNav);
+    if (cookieHeader) headers.set('Cookie', cookieHeader);
+    else headers.delete('Cookie');
+    const hopInit = Object.assign({}, cur, { headers });
+    if (cookieHeader) hopInit.cf = undefined;
+    const res = await fetchUpstream(url, hopInit);
+    storeSetCookies(jar, target, getSetCookies(res.headers));
+    if (![301, 302, 303, 307, 308].includes(res.status)) return { response: res, unreplayable: false, url };
+    const loc = res.headers.get('Location');
+    let next = null;
+    if (loc) {
+      try {
+        next = new URL(loc, url);
+      } catch {
+        next = null;
+      }
+    }
+    if (!next || !/^https?:$/.test(next.protocol)) return { response: res, unreplayable: false, url };
+    if (hop >= JAR_MAX_HOPS) throw new Error('Too many redirects');
+    const dropBody = res.status === 303 || ((res.status === 301 || res.status === 302) && cur.method === 'POST');
+    if (dropBody) {
+      cur = Object.assign({}, cur, { method: 'GET' });
+      delete cur.body;
+      delete cur.duplex;
+      const h = new Headers(cur.headers);
+      h.delete('Content-Type');
+      h.delete('Content-Length');
+      cur.headers = h;
+    } else if (cur.body) {
+      return { response: res, unreplayable: true, url };
+    }
+    url = next.href;
+  }
+}
+
+// Is this request for one of the relay's own pages (/login, /logout, /cookies)
+// rather than a proxied site's root-relative link of the same name that
+// escaped to the relay's origin? A request whose Referer is a proxied page is
+// an escape (the Referer logic then repairs it); POSTs and the login redirect
+// (which always carries ?redirect=) are the relay's own.
+const RELAY_ROUTE_PATHS = new Set(['/', '/login', '/logout', '/cookies']);
+
+function looksLikeProxiedPageReferer(request, proxyOrigin) {
+  const ref = request.headers.get('Referer');
+  if (!ref) return false;
+  if (recoverRealUrl(ref, proxyOrigin)) return true;
+  if (!getCtxOrigin(request)) return false;
+  try {
+    const r = new URL(ref);
+    return r.origin === proxyOrigin && !RELAY_ROUTE_PATHS.has(r.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function isRelayOwnRequest(request, url, proxyOrigin) {
+  if (request.method === 'POST') return true;
+  if (url.searchParams.has('redirect') || url.searchParams.has('error')) return true;
+  return !looksLikeProxiedPageReferer(request, proxyOrigin);
+}
+
+function cookiesPage(jar) {
+  const hosts = new Map();
+  const now = Date.now();
+  for (const e of jar.entries.values()) {
+    const live = e.records.filter((r) => !(r[3] && r[3] <= now)).length;
+    hosts.set(e.host, (hosts.get(e.host) || 0) + live);
+  }
+  const rows = [...hosts.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([h, n]) =>
+    '<tr><td>' + escapeHtml(h) + '</td><td>' + n + '</td><td>' +
+    '<form method="POST" action="' + COOKIES_PATH + '"><input type="hidden" name="host" value="' + escapeHtml(h) + '">' +
+    '<button type="submit">Clear</button></form></td></tr>').join('');
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relay — Cookies</title>
+<style>
+  :root { --bg:#FFFFFF; --surface:#F6F6F5; --border:#E1E1DE; --text:#131316; --text-dim:#6C6C72; --accent:#2547F4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0A0A0C; --surface:#151517; --border:#29292D; --text:#F1F1EF; --text-dim:#8B8B91; --accent:#6C89FF; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
+  .wrap { max-width:560px; margin:0 auto; padding:32px 24px 60px; }
+  h1 { font-size:22px; margin:0 0 8px; }
+  p { font-size:14px; line-height:1.5; color:var(--text-dim); margin:0 0 20px; }
+  a { color:var(--accent); }
+  table { width:100%; border-collapse:collapse; font-size:14px; margin-bottom:20px; }
+  td, th { text-align:left; padding:10px 8px; border-bottom:1px solid var(--border); word-break:break-all; }
+  th { color:var(--text-dim); font-weight:500; }
+  button { border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:4px; padding:6px 12px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--text-dim); }
+  form { margin:0; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Cookies</h1>
+    <p>Cookies for the sites you browse are kept in this browser, on the relay's own address, and sent to each site as if they had been set by it. Clearing them signs you out of those sites. <a href="/">Back to relay</a></p>
+    ${rows ? '<table><tr><th>Site</th><th>Cookies</th><th></th></tr>' + rows + '</table>' : '<p>No site cookies stored.</p>'}
+    ${rows ? '<form method="POST" action="' + COOKIES_PATH + '"><input type="hidden" name="host" value="*"><button type="submit">Clear all cookies</button></form>' : ''}
+  </div>
+</body>
+</html>`;
+}
 
 // Real origin of a real-path-mode page, from the cookie its injected script
 // sets (null when absent or malformed).
@@ -131,6 +562,10 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(Response.redirect(self.location.origin + '/' + collapsed[1] + '://' + collapsed[2] + url.search, 302));
     return;
   }
+
+  // The relay's own pages: the server decides whether one is the relay's or a
+  // proxied site's escaped link of the same name.
+  if (url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/cookies') return;
 
   // Already correctly path-embedded, or the SW script/root usage page — leave alone.
   if (/^\\/https?:\\/\\//.test(url.pathname)) return;
@@ -241,6 +676,25 @@ const HOME_HTML = `<!doctype html>
   .theme-toggle svg { width: 15px; height: 15px; }
 
   main { flex: 1; }
+
+  .header-right { display: flex; align-items: center; gap: 10px; }
+  .header-btn {
+    display: flex;
+    align-items: center;
+    height: 34px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-decoration: none;
+    transition: border-color 0.15s ease;
+  }
+  .header-btn:hover { border-color: var(--text-dim); }
 
   .eyebrow {
     font-family: 'JetBrains Mono', monospace;
@@ -376,12 +830,15 @@ const HOME_HTML = `<!doctype html>
   <div class="wrap">
     <header>
       <div class="mark"><span class="dot"></span>relay</div>
+      <div class="header-right">
+      __RELAY_HEADER_ACTIONS__
       <button class="theme-toggle" id="themeToggle" aria-label="Switch theme" type="button">
         <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
           <circle cx="12" cy="12" r="4.6"></circle>
           <path d="M12 2.4v2.4M12 19.2v2.4M4.4 12H2M22 12h-2.4M5.6 5.6l1.7 1.7M16.7 16.7l1.7 1.7M5.6 18.4l1.7-1.7M16.7 7.3l1.7-1.7"></path>
         </svg>
       </button>
+      </div>
     </header>
 
     <main>
@@ -792,8 +1249,11 @@ function errorResponse(proxyOrigin, status, title, message, detail, targetUrl) {
 // set (via `wrangler secret put PASSWORD` or a dashboard env var). Unset —
 // the default — means the relay behaves exactly as before, no auth at all.
 const AUTH_COOKIE = '__relay_pwd';
-const AUTH_PATH = '/__relay_login';
-const LOGOUT_PATH = '/__relay_logout';
+const AUTH_PATH = '/login';
+const LOGOUT_PATH = '/logout';
+// Pre-v0.10 URLs; kept as redirects so old bookmarks keep working.
+const OLD_AUTH_PATH = '/__relay_login';
+const OLD_LOGOUT_PATH = '/__relay_logout';
 
 // `redirect` is user-controlled and gets appended to our origin. Anything
 // not a plain absolute path could escape it: "@evil.com" parses as userinfo
@@ -912,6 +1372,17 @@ async function handleWebSocketUpgrade(request, url, proxyOrigin) {
   const requestedProtocol = request.headers.get('Sec-WebSocket-Protocol');
   if (requestedProtocol) upstreamHeaders.set('Sec-WebSocket-Protocol', requestedProtocol);
 
+  // The visitor's cookies for the target, so socket handshakes that
+  // authenticate by cookie work.
+  if (COOKIE_JAR) {
+    try {
+      const wsCookies = jarCookieHeader(loadJar(request), new URL(httpEquivalent), false, false);
+      if (wsCookies) upstreamHeaders.set('Cookie', wsCookies);
+    } catch {
+      // no cookies for this socket
+    }
+  }
+
   let upstream;
   try {
     // 10s is generous for a handshake specifically (not the connection's
@@ -970,13 +1441,23 @@ export default {
 
     // Entirely a no-op when env.PASSWORD isn't set — see relayIsAuthed.
     if (env && env.PASSWORD) {
-      if (url.pathname === LOGOUT_PATH) {
+      // Pre-v0.10 URLs.
+      if (url.pathname === OLD_LOGOUT_PATH) return Response.redirect(proxyOrigin + LOGOUT_PATH, 302);
+      if (url.pathname === OLD_AUTH_PATH) return Response.redirect(proxyOrigin + AUTH_PATH + url.search, 302);
+
+      // /login and /logout are short, common names: a proxied site's own
+      // root-relative link to its /login that escaped to this origin must
+      // still be repaired from the Referer, not answered by the relay.
+      const ownRoute = (url.pathname === LOGOUT_PATH || url.pathname === AUTH_PATH) &&
+        isRelayOwnRequest(request, url, proxyOrigin);
+
+      if (ownRoute && url.pathname === LOGOUT_PATH) {
         const headers = new Headers({ Location: proxyOrigin + AUTH_PATH });
         headers.append('Set-Cookie', `${AUTH_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
         return new Response(null, { status: 302, headers });
       }
 
-      if (url.pathname === AUTH_PATH) {
+      if (ownRoute && url.pathname === AUTH_PATH) {
         if (request.method === 'POST') {
           const form = await request.formData();
           const submitted = String(form.get('password') || '');
@@ -1049,6 +1530,26 @@ export default {
           }
         }
       );
+    }
+
+    // Cookie manager: lists the sites that have cookies in this browser's jar
+    // and clears them. Like /login, a proxied site's own /cookies link that
+    // escaped to this origin is repaired from the Referer instead.
+    if (COOKIE_JAR && url.pathname === COOKIES_PATH && isRelayOwnRequest(request, url, proxyOrigin)) {
+      const jarForPage = loadJar(request);
+      if (request.method === 'POST') {
+        const form = await request.formData();
+        const which = String(form.get('host') || '*');
+        const headers = new Headers({ Location: proxyOrigin + COOKIES_PATH });
+        for (const name of jarForPage.raw.keys()) {
+          if (which === '*' || b64uDec(name.slice(7)) === which) headers.append('Set-Cookie', jarExpireHeader(name));
+        }
+        return new Response(null, { status: 302, headers });
+      }
+      return new Response(cookiesPage(jarForPage), {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
+      });
     }
 
     // Some client code (Next.js's router does this) collapses "//" in paths:
@@ -1147,12 +1648,17 @@ export default {
     let targetUrl = url.pathname.slice(1) + url.search;
 
     if (!targetUrl) {
-      // Only shown when a password is configured — otherwise there's no
-      // session to log out of, and the homepage is unchanged.
-      const logoutLink = (env && env.PASSWORD)
-        ? ` · <a href="${LOGOUT_PATH}" style="color:inherit;">log out</a>`
-        : '';
-      return new Response(HOME_HTML.replace('__RELAY_LOGOUT_LINK__', logoutLink), {
+      // The log-out controls only exist when a password is configured —
+      // otherwise there's no session to log out of.
+      const hasPassword = !!(env && env.PASSWORD);
+      const footerLinks = [];
+      if (hasPassword) footerLinks.push(`<a href="${LOGOUT_PATH}" style="color:inherit;">log out</a>`);
+      if (COOKIE_JAR) footerLinks.push(`<a href="${COOKIES_PATH}" style="color:inherit;">cookies</a>`);
+      const headerActions = hasPassword ? `<a class="header-btn" href="${LOGOUT_PATH}">Log out</a>` : '';
+      const homeHtml = HOME_HTML
+        .replace('__RELAY_LOGOUT_LINK__', footerLinks.map((l) => ' · ' + l).join(''))
+        .replace('__RELAY_HEADER_ACTIONS__', headerActions);
+      return new Response(homeHtml, {
         status: 200,
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       });
@@ -1194,7 +1700,32 @@ export default {
 
     // Edge cache: identical proxied requests skip origin + rewriting entirely.
     // GET-only — the Cache API throws on non-GET requests.
-    const cacheable = request.method === 'GET';
+    // Cookie jar (see COOKIE_JAR): this visitor's cookies for the target, as an
+    // ordinary Cookie header. A request carrying cookies is personalized, so
+    // it bypasses every cache below.
+    const jarOn = COOKIE_JAR;
+    const jar = jarOn ? loadJar(request) : null;
+    let jarCtx = null;
+    let cookieHeader = '';
+    if (jarOn) {
+      let pageSite = '';
+      try {
+        const po = resolvePageContext(request, proxyOrigin).origin;
+        if (po) pageSite = siteOf(new URL(po).hostname);
+      } catch {
+        // unknown page: treated as same-site
+      }
+      jarCtx = {
+        pageSite,
+        topNav: request.method === 'GET' &&
+          request.headers.get('Sec-Fetch-Mode') === 'navigate' &&
+          request.headers.get('Sec-Fetch-Dest') === 'document'
+      };
+      const crossSite = !!pageSite && siteOf(parsedTarget.hostname) !== pageSite;
+      cookieHeader = jarCookieHeader(jar, parsedTarget, crossSite, jarCtx.topNav);
+    }
+
+    const cacheable = request.method === 'GET' && !cookieHeader;
     const cache = caches.default;
     // The cache key embeds a token derived from the request's Accept header:
     // the real browser's Accept is forwarded upstream, so the same URL can
@@ -1221,18 +1752,24 @@ export default {
       method: request.method,
       headers: buildUpstreamHeaders(request, proxyOrigin, parsedTarget.origin),
       redirect: 'follow',
-      // cacheEverything is safe here specifically because this proxy never
-      // forwards cookies (see README limitations) — every response is
-      // already the same generic, non-personalized view for everyone, so
-      // caching it at Cloudflare's fetch layer (not just our own edge
-      // cache below) cuts a real origin round-trip on repeat hits.
+      // cacheEverything is only safe for anonymous responses, so it is off
+      // for any request that carries jar cookies and — once the cookie jar is
+      // on, since a first visit can set a cookie that a cached copy would
+      // never replay to the next visitor — for everything except static
+      // assets (script/style/image/font). With the jar off it applies as
+      // before. It caches at Cloudflare's fetch layer (not just our own edge
+      // cache below), which cuts a real origin round-trip on repeat hits.
       // cacheTtlByStatus, not cacheTtl: with cacheEverything, cacheTtl
       // applies to error statuses too, so a single transient 500/404 was
       // replayed from Cloudflare's cache to every visitor for the full
       // TTL. 1s on the error ranges is effectively "don't cache" without
       // relying on 0-TTL handling.
-      cf: noEdgeCache ? undefined : { cacheEverything: true, cacheTtlByStatus: { '200-299': 120, '400-499': 1, '500-599': 1 } }
+      cf: (noEdgeCache || cookieHeader || (jarOn && !/^(script|style|image|font)$/.test(request.headers.get('Sec-Fetch-Dest') || '')))
+        ? undefined
+        : { cacheEverything: true, cacheTtlByStatus: { '200-299': 120, '400-499': 1, '500-599': 1 } }
     };
+    if (cookieHeader) upstreamInit.headers.set('Cookie', cookieHeader);
+
     // Forward the real request body for non-GET/HEAD methods — previously
     // every upstream fetch was an implicit GET regardless of the incoming
     // request, silently dropping POST bodies (breaks GraphQL calls, search
@@ -1245,8 +1782,17 @@ export default {
     const upstreamHref = stripProxyFromQuery(parsedTarget, proxyOrigin, resolvePageContext(request, proxyOrigin).origin);
 
     let upstream;
+    let upstreamUnreplayable = false;
+    let upstreamHopUrl = upstreamHref;
     try {
-      upstream = await fetchUpstream(upstreamHref, upstreamInit);
+      if (jarOn) {
+        const hopResult = await fetchWithJar(upstreamHref, upstreamInit, jar, jarCtx);
+        upstream = hopResult.response;
+        upstreamUnreplayable = hopResult.unreplayable;
+        upstreamHopUrl = hopResult.url;
+      } else {
+        upstream = await fetchUpstream(upstreamHref, upstreamInit);
+      }
     } catch (error) {
       return errorResponse(proxyOrigin, 502, "Couldn't reach that address", 'The request to the target failed before any response came back.', error.message, parsedTarget.href);
     }
@@ -1259,6 +1805,25 @@ export default {
     const CF_EDGE_ERROR_STATUSES = new Set([520, 521, 522, 523, 524, 525, 526, 527, 530]);
     if (CF_EDGE_ERROR_STATUSES.has(upstream.status)) {
       return errorResponse(proxyOrigin, 502, "Couldn't reach that address", "The target domain didn't respond — it may not exist, or is temporarily unreachable.", 'Double-check the address for typos.', parsedTarget.href);
+    }
+
+    // Jar updates from every hop of this request, ready to hand to the browser.
+    const jarSetCookies = jarOn ? jarSetCookieHeaders(jar) : [];
+
+    // A 307/308 whose streamed body can't be replayed by us: let the browser
+    // follow it (rewritten to stay inside the relay), cookies included.
+    if (upstreamUnreplayable) {
+      let dest = '';
+      try {
+        dest = proxyOrigin + '/' + new URL(upstream.headers.get('Location'), upstreamHopUrl).href;
+      } catch {
+        dest = '';
+      }
+      if (dest) {
+        const rh = new Headers({ Location: dest });
+        withJarCookies(rh, jarSetCookies);
+        return new Response(null, { status: upstream.status, headers: rh });
+      }
     }
 
     const contentType = upstream.headers.get('content-type') || '';
@@ -1292,7 +1857,7 @@ export default {
         const text = await upstream.text();
         const rewritten = rewriteEmbeddedUrls(text, upstream.url || parsedTarget.href, proxyOrigin);
         const dataHeaders = new Headers(upstream.headers);
-        dataHeaders.delete('Set-Cookie');
+        withJarCookies(dataHeaders, jarSetCookies);
         return new Response(rewritten, {
           status: upstream.status,
           statusText: upstream.statusText,
@@ -1303,7 +1868,7 @@ export default {
       if (upstream.status === 200 && isLongCacheable(contentType)) {
         const headers = new Headers(upstream.headers);
         headers.set('Cache-Control', 'public, max-age=86400');
-        headers.delete('Set-Cookie');
+        withJarCookies(headers, jarSetCookies);
         const asset = new Response(upstream.body, {
           status: upstream.status,
           statusText: upstream.statusText,
@@ -1316,10 +1881,10 @@ export default {
         // from the Cache-Control header above either way.
         const lengthHeader = upstream.headers.get('content-length');
         const tooLargeToCache = lengthHeader && parseInt(lengthHeader, 10) > ASSET_CACHE_SIZE_LIMIT;
-        if (cacheable && !tooLargeToCache) ctx.waitUntil(cache.put(cacheKey, asset.clone()));
+        if (cacheable && !tooLargeToCache && !jarSetCookies.length) ctx.waitUntil(cache.put(cacheKey, asset.clone()));
         return asset;
       }
-      return stripSetCookie(upstream);
+      return jarSetCookies.length ? rebuildWithJarCookies(upstream, jarSetCookies) : stripSetCookie(upstream);
     }
 
     // If the target redirected (bbc.com -> www.bbc.com), send the browser to
@@ -1334,7 +1899,9 @@ export default {
         finalUrl.hash = '';
         requestedUrl.hash = '';
         if (finalUrl.href !== requestedUrl.href && finalUrl.origin !== proxyOrigin) {
-          return Response.redirect(proxyOrigin + '/' + finalUrl.href, 302);
+          const rh = new Headers({ Location: proxyOrigin + '/' + finalUrl.href });
+          withJarCookies(rh, jarSetCookies);
+          return new Response(null, { status: 302, headers: rh });
         }
       } catch {
         // fall through and serve normally
@@ -1377,20 +1944,24 @@ export default {
       .on('source[srcset]', new SrcsetRewriter(baseUrl, proxyOrigin))
       .on('meta[http-equiv]', new MetaRefreshRewriter(baseUrl, proxyOrigin))
       .on('head', new BaseTagInjector(proxiedBase))
-      .on('head', new ScriptInjector(proxyOrigin, spoofPath));
+      .on('head', new ScriptInjector(proxyOrigin, spoofPath, COOKIE_JAR));
 
     const transformed = rewriter.transform(upstream);
 
+    const htmlHeaders = new Headers({
+      'Content-Type': 'text/html; charset=utf-8',
+      // A page built with the visitor's cookies must not be stored by shared caches.
+      'Cache-Control': (cookieHeader || jarSetCookies.length) ? 'private, no-cache' : 'public, max-age=60'
+    });
+    withJarCookies(htmlHeaders, jarSetCookies);
     const response = new Response(transformed.body, {
       status: upstream.status,
       statusText: upstream.statusText,
-      headers: {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'public, max-age=60'
-      }
+      headers: htmlHeaders
     });
 
-    if (cacheable) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    // Never put a response that set cookies (they are this visitor's) in the edge cache.
+    if (cacheable && !jarSetCookies.length) ctx.waitUntil(cache.put(cacheKey, response.clone()));
     return response;
   }
 };
@@ -1824,9 +2395,10 @@ class BaseTagInjector {
 }
 
 class ScriptInjector {
-  constructor(proxyOrigin, realPath) {
+  constructor(proxyOrigin, realPath, cookieJar) {
     this.proxyOrigin = proxyOrigin;
     this.realPath = realPath || '';
+    this.cookieJar = !!cookieJar;
   }
   element(el) {
     el.prepend(
@@ -1837,6 +2409,19 @@ class ScriptInjector {
       // Real-path mode (see REAL_PATH_HOSTS on the server). Empty = normal mode.
       var relaySpoofPath = ${JSON.stringify(this.realPath || '').replace(/</g, '\\u003c')};
       var relaySpoofReal = '';
+      // Cookie jar (see COOKIE_JAR on the server): document.cookie is replaced
+      // by a shim over the jar cookies. Everything in this script that needs
+      // the page's REAL cookie string (the relay's own debug and context
+      // cookies) goes through these two native accessors.
+      var relayJarOn = ${this.cookieJar ? 'true' : 'false'};
+      var relayCookieDesc = null;
+      try { relayCookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie'); } catch (e) {}
+      function relayRawCookie() {
+        try { return relayCookieDesc && relayCookieDesc.get ? relayCookieDesc.get.call(document) : document.cookie; } catch (e) { return ''; }
+      }
+      function relayRawCookieSet(v) {
+        try { if (relayCookieDesc && relayCookieDesc.set) relayCookieDesc.set.call(document, v); else document.cookie = v; } catch (e) {}
+      }
 
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.register('${SW_PATH}').catch(function() {});
@@ -1882,11 +2467,151 @@ class ScriptInjector {
           // Capture the real URL BEFORE changing the address bar.
           relaySpoofReal = realBase();
           history.replaceState(history.state, '', relaySpoofPath + location.hash);
-          document.cookie = '__relay_ctx=' + encodeURIComponent(new URL(relaySpoofReal).origin) +
-            '; path=/; max-age=86400; samesite=lax; secure';
+          relayRawCookieSet('__relay_ctx=' + encodeURIComponent(new URL(relaySpoofReal).origin) +
+            '; path=/; max-age=86400; samesite=lax; secure');
         } catch (e) {
           relaySpoofPath = '';
         }
+      }
+
+      // --- Cookie jar: document.cookie shim --------------------------------
+      // The Worker keeps each site's cookies in jar cookies on the relay's
+      // origin (see COOKIE_JAR). A page's own JavaScript still expects
+      // document.cookie to hold ITS cookies, so reads return the script-visible
+      // ones for this page's real host and writes update that jar. HttpOnly
+      // cookies live in a separate jar this script never touches. The record
+      // format and the base64url codec must match the Worker's exactly.
+      function relayB64Enc(str) {
+        return btoa(unescape(encodeURIComponent(str))).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+      }
+      function relayB64Dec(b) {
+        var t = String(b).replace(/-/g, '+').replace(/_/g, '/');
+        while (t.length % 4) t += '=';
+        return decodeURIComponent(escape(atob(t)));
+      }
+      function relayPathMatch(reqPath, cp) {
+        if (reqPath === cp) return true;
+        if (reqPath.indexOf(cp) !== 0) return false;
+        return cp.charAt(cp.length - 1) === '/' || reqPath.charAt(cp.length) === '/';
+      }
+      function relayJarRead() {
+        var out = {};
+        var prefix = '__rj_s_';
+        var parts = relayRawCookie().split(';');
+        for (var i = 0; i < parts.length; i++) {
+          var c = parts[i].trim();
+          var eq = c.indexOf('=');
+          if (eq <= 0 || c.indexOf(prefix) !== 0) continue;
+          try {
+            var host = relayB64Dec(c.slice(prefix.length, eq));
+            var recs = JSON.parse(relayB64Dec(c.slice(eq + 1)));
+            if (Array.isArray(recs)) out[host] = recs;
+          } catch (e) {}
+        }
+        return out;
+      }
+      function relayJarWrite(host, recs) {
+        var name = '__rj_s_' + relayB64Enc(host);
+        var now = Date.now();
+        recs = recs.filter(function(r) { return !(r[3] && r[3] <= now); });
+        var secure = location.protocol === 'https:' ? '; Secure' : '';
+        var value = '';
+        while (recs.length) {
+          value = relayB64Enc(JSON.stringify(recs));
+          if (value.length <= 3000) break;
+          recs.shift();
+          value = '';
+        }
+        if (!recs.length || !value) {
+          relayRawCookieSet(name + '=; Path=/; Max-Age=0' + secure);
+          return;
+        }
+        var maxExp = 0;
+        for (var i = 0; i < recs.length; i++) if (recs[i][3] && recs[i][3] > maxExp) maxExp = recs[i][3];
+        relayRawCookieSet(name + '=' + value + '; Path=/; SameSite=Lax' + secure +
+          (maxExp ? '; Max-Age=' + Math.max(1, Math.floor((maxExp - now) / 1000)) : ''));
+      }
+      function relayCookieGet() {
+        var u = new URL(realBase());
+        var host = u.hostname.toLowerCase();
+        var path = u.pathname || '/';
+        var https = u.protocol === 'https:';
+        var now = Date.now();
+        var jars = relayJarRead();
+        var picked = [];
+        for (var key in jars) {
+          if (!(host === key || host.slice(-(key.length + 1)) === '.' + key)) continue;
+          if (key !== host && key.indexOf('.') < 0) continue;
+          jars[key].forEach(function(r) {
+            if (r[3] && r[3] <= now) return;
+            if (r[5] && host !== key) return;
+            if (r[4] && !https) return;
+            if (!relayPathMatch(path, r[2])) return;
+            picked.push(r);
+          });
+        }
+        picked.sort(function(a, b) { return b[2].length - a[2].length; });
+        return picked.map(function(r) { return r[0] + '=' + r[1]; }).join('; ');
+      }
+      function relayCookieSet(str) {
+        var parts = String(str).split(';');
+        var first = parts.shift() || '';
+        var eq = first.indexOf('=');
+        if (eq <= 0) return;
+        var name = first.slice(0, eq).trim();
+        var value = first.slice(eq + 1).trim();
+        if (!name) return;
+        var u = new URL(realBase());
+        var host = u.hostname.toLowerCase();
+        var domain = '', path = '', maxAge = null, expires = null, secure = false, sameSite = 1;
+        for (var i = 0; i < parts.length; i++) {
+          var p = parts[i];
+          var j = p.indexOf('=');
+          var k = (j < 0 ? p : p.slice(0, j)).trim().toLowerCase();
+          var v = j < 0 ? '' : p.slice(j + 1).trim();
+          if (k === 'domain') domain = v;
+          else if (k === 'path') path = v;
+          else if (k === 'max-age') { var n = parseInt(v, 10); if (!isNaN(n)) maxAge = n; }
+          else if (k === 'expires') expires = v;
+          else if (k === 'secure') secure = true;
+          else if (k === 'samesite') { var sv = v.toLowerCase(); sameSite = sv === 'none' ? 0 : sv === 'strict' ? 2 : 1; }
+        }
+        var key = host, hostOnly = 1;
+        if (domain) {
+          var d = domain.replace(/^\\./, '').toLowerCase();
+          if (!(host === d || host.slice(-(d.length + 1)) === '.' + d)) return;
+          if (d !== host && d.indexOf('.') < 0) return;
+          key = d;
+          hostOnly = 0;
+        }
+        if (!path || path.charAt(0) !== '/') {
+          var pp = u.pathname || '/';
+          var idx = pp.lastIndexOf('/');
+          path = idx <= 0 ? '/' : pp.slice(0, idx);
+        }
+        if (secure && u.protocol !== 'https:') return;
+        var now = Date.now();
+        var del = false, exp = 0;
+        if (maxAge !== null) {
+          if (maxAge <= 0) del = true; else exp = now + Math.min(maxAge * 1000, 400 * 24 * 3600 * 1000);
+        } else if (expires) {
+          var t = Date.parse(expires);
+          if (!isNaN(t)) { if (t <= now) del = true; else exp = Math.min(t, now + 400 * 24 * 3600 * 1000); }
+        }
+        var jars = relayJarRead();
+        var recs = (jars[key] || []).filter(function(r) { return !(r[0] === name && r[2] === path); });
+        if (!del) recs.push([name, value, path, exp, secure ? 1 : 0, hostOnly, sameSite]);
+        relayJarWrite(key, recs);
+      }
+      if (relayJarOn && relayCookieDesc && relayCookieDesc.get && relayCookieDesc.set) {
+        try {
+          Object.defineProperty(Document.prototype, 'cookie', {
+            get: function() { try { return relayCookieGet(); } catch (e) { return ''; } },
+            set: function(v) { try { relayCookieSet(v); } catch (e) {} },
+            configurable: true,
+            enumerable: relayCookieDesc.enumerable
+          });
+        } catch (e) {}
       }
 
       // Mirrors decodeTrackingRedirect on the server side (same three
@@ -2105,7 +2830,7 @@ class ScriptInjector {
       // 24 h cookie), so it can be enabled from a phone without editing this
       // file. It turns on NO_LINK and NAV logging, adds Navigation-API events,
       // and keeps a log in sessionStorage that survives page jumps.
-      var RELAY_DEBUG = /(?:^|;\\s*)__relay_debug=1/.test(document.cookie);
+      var RELAY_DEBUG = /(?:^|;\\s*)__relay_debug=1/.test(relayRawCookie());
       var RELAY_LOG_NO_LINK = RELAY_DEBUG;
       var __relayHist = [];
       if (RELAY_DEBUG) {
