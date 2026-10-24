@@ -5,9 +5,7 @@ domain: links, forms, scripts, WebSockets and client-side navigation stay on
 the relay instead of escaping to the real site.
 
 ```
-
 https://relay.<username>.workers.dev/https://example.com/page?x=1
-
 ```
 
 - `_worker.js`: the Worker. Single file, no build step, no dependencies.
@@ -23,9 +21,7 @@ https://relay.<username>.workers.dev/https://example.com/page?x=1
 From the folder containing `_worker.js` and `wrangler.jsonc`:
 
 ```
-
 npx wrangler deploy
-
 ```
 
 Validate first with `npx wrangler deploy --dry-run --outdir dist` — bundling
@@ -42,9 +38,7 @@ Set a `PASSWORD` secret and the whole relay (homepage, proxying, WebSockets,
 everything) requires it:
 
 ```
-
 npx wrangler secret put PASSWORD
-
 ```
 
 (or Settings → Variables and Bindings → Add → **Secret** in the dashboard;
@@ -96,11 +90,19 @@ copies a working relay link for it, and **Copy** puts the failure list on the
 clipboard without DevTools. Cloudflare's own `/cdn-cgi/` requests and preload
 failures are filtered out so they don't inflate N.
 
-Two debugging flags sit at the top of the diagnostic section of the injected
-script, both off by default: `RELAY_LOG_NO_LINK` (log clicks on elements with
-no `<a>` in their path — these are not failures, only useful when hunting for
-link-less navigation escapes) and `RELAY_LOG_NAV` (log every
-`pushState`/`replaceState` call as original → proxied).
+**Debug mode:** visit `https://relay.<username>.workers.dev/__relay_debug` to
+turn on verbose diagnostics for 24 hours (a cookie; `/__relay_debug?on=0` turns
+it off) — handy on a phone, where editing the worker for a flag isn't an
+option. It logs clicks with no `<a>` in their path (`RELAY_LOG_NO_LINK`, not
+failures — only useful when hunting for link-less navigation escapes), every
+`pushState`/`replaceState` call as original → proxied (`RELAY_LOG_NAV`) and,
+where the browser supports the Navigation API (Chromium), every navigation
+including `location.href = …` assignments. The log is also kept in
+`sessionStorage`, so after a page jumps away (for example back to a site's
+home page) the panel on the next page still shows what happened before the
+jump. Failed `fetch`/XHR entries also include the first 200 characters of
+the response body, which is how bot-protection responses explain themselves.
+Open the panel and use Copy to paste it back.
 
 **Real-path hosts (experimental):** on a few hosts the address bar shows a
 bare real path (`/search?q=…`) instead of the embedded form
@@ -131,17 +133,20 @@ CSS `url()`) works inside files the relay never parses.
   injected `<base>` agree.
 - Real method, body and headers are forwarded (a denylist, so custom API
   headers survive). The visitor's real `User-Agent` is forwarded. `Referer`
-  and `Origin` are corrected to the real site. Relay-wrapped URLs inside an
-  upstream query string (a consent manager's `href=<relay>/https://…`) are
-  restored to the real URL. Cookies are never forwarded, and upstream
-  `Set-Cookie` headers are stripped.
+  and `Origin` are corrected to the page's real URL and origin (for
+  real-path pages, from the `__relay_ctx` cookie), which media CDNs and CORS
+  allow-lists check. Relay-wrapped URLs inside an upstream query string (a
+  consent manager's `href=<relay>/https://…`, or `href=<relay>/news` on a
+  real-path page) are restored to the real URL. Cookies are never forwarded,
+  and upstream `Set-Cookie` headers are stripped.
 - Timeout, one retry for bodyless requests, `Retry-After`-aware backoff on
   429/503, and a styled error page for Cloudflare edge failures.
 - Caching: edge cache for HTML and static assets (GET only), keyed partly on
   the request's `Accept` header with per-status TTLs (`cacheTtlByStatus`);
   Cloudflare's fetch cache; long browser caching for static types. Safe
   because every response is anonymous. Large assets (>20 MB) skip the
-  edge-cache copy.
+  edge-cache copy. Range requests and HLS/DASH manifests (`.m3u8`, `.mpd`)
+  bypass the blanket edge cache — a cached live playlist stalls playback.
 - WebSockets are bridged browser to Worker to target, including subprotocol
   negotiation and the real `Origin`.
 - The relay answers `/favicon.ico` and `/robots.txt` at its own root, so
@@ -188,21 +193,21 @@ To change which hosts use it, edit the single constant near the top of
 const REAL_PATH_HOSTS = /^(www\.)?(bbc\.com|bbc\.co\.uk|github\.com|react\.dev)$/i;
 ```
 
-Set it to /^$/ to disable the mode everywhere. Add a host only when it shows
+Set it to `/^$/` to disable the mode everywhere. Add a host only when it shows
 the same symptoms (a client-side crash or dead widgets, with
-location.pathname visible in the error); sites that already work should not
+`location.pathname` visible in the error); sites that already work should not
 be added.
 
 ---
 
-Editing and verifying _worker.js
+## Editing and verifying `_worker.js`
 
 The injected script is a string inside a template literal (in
-ScriptInjector), so node --check _worker.js does not validate it. A
+`ScriptInjector`), so **`node --check _worker.js` does not validate it.** A
 syntax error there stops the whole script in the browser while the outer file
 still checks clean — this has happened twice: a stray brace (caught
 pre-deploy) and the template-escaping bug that shipped from v0.5.0 to
-v0.9.0. The injected script contains ${…} placeholders, so check the text
+v0.9.0. The injected script contains `${…}` placeholders, so check the text
 the browser actually receives — evaluate the template, don't grep the source.
 Run all three checks:
 
@@ -225,99 +230,111 @@ node --check inj.js
 node --check sw.js
 ```
 
-inj.js is the client script as emitted (with real-path mode on — pass ''
-instead of '/x' to check the normal mode), sw.js the relay's Service
+`inj.js` is the client script as emitted (with real-path mode on — pass `''`
+instead of `'/x'` to check the normal mode), `sw.js` the relay's Service
 Worker script. The Service Worker script is also a template literal and has
 the same backslash rule.
 
-Backslash rule: a backslash inside the injected script (and the Service
-Worker script) must be written doubled in the source. The template
-literal consumes one level: source \/ emits /, which is how /\/ck\/a$/i
-became the line comment //ck/a$/i and killed the whole client script from
+**Backslash rule:** a backslash inside the injected script (and the Service
+Worker script) must be written **doubled** in the source. The template
+literal consumes one level: source `\/` emits `/`, which is how `/\/ck\/a$/i`
+became the line comment `//ck/a$/i` and killed the whole client script from
 v0.5.0 until v0.9.0. Evaluating the template, as above, catches a mis-escape
-that produces a syntax error. It does not catch one that still parses
-but means something else — a missing \\/ once turned "path starts with
-/https://" into "starts with /https:/" and passed every syntax check. For
-URL logic, run the function on sample inputs (toProxied('/https:/react.dev/')
-and friends) or the panel smoke test below, not just --check.
+that produces a syntax error. It does **not** catch one that still parses
+but means something else — a missing `\\/` once turned "path starts with
+`/https://`" into "starts with `/https:/`" and passed every syntax check. For
+URL logic, run the function on sample inputs (`toProxied('/https:/react.dev/')`
+and friends) or the panel smoke test below, not just `--check`.
+
+Also avoid backticks and `${` inside the injected script's comments and code:
+they end or interpolate the template literal itself.
 
 Inside the injected script, read link attributes with
-relayNativeGetAttr / write with relayNativeSetAttr. The hooked
-getAttribute returns the unwrapped URL, so using it for an "already
+`relayNativeGetAttr` / write with `relayNativeSetAttr`. The hooked
+`getAttribute` returns the *unwrapped* URL, so using it for an "already
 proxied" check never matches and causes an infinite rewrite loop.
 
 ---
 
-Quick test checklist
+## Quick test checklist
 
-1. Homepage loads; footer shows build v0.10.0 · path-embedded.
-2. /https://example.com: page renders, link clicks stay on the relay.
+1. Homepage loads; footer shows `build v0.10.0 · path-embedded`.
+2. `/https://example.com`: page renders, link clicks stay on the relay.
 3. DuckDuckGo search: result links show the relay prefix on hover and stay on
    the relay when clicked; switching All / Images / Videos / News keeps
-   duckduckgo.com embedded in the relay URL; video thumbnails load.
-4. https://echo.websocket.org/.ws: connects and echoes (WebSocket bridge).
-5. With PASSWORD set: any URL redirects to /__relay_login; a wrong password
+   `duckduckgo.com` embedded in the relay URL; video thumbnails load.
+4. `https://echo.websocket.org/.ws`: connects and echoes (WebSocket bridge).
+5. With `PASSWORD` set: any URL redirects to `/__relay_login`; a wrong password
    returns to the form with an error and no resubmit prompt; a correct one
-   lands on the original destination; /__relay_logout ends the session.
-6. Deliberately bad input (/https://gitbub.com) shows a styled error page,
+   lands on the original destination; `/__relay_logout` ends the session.
+6. Deliberately bad input (`/https://gitbub.com`) shows a styled error page,
    not Cloudflare's.
 7. Panel smoke test (proves the injected script is alive): open a proxied
    page with at least one broken subresource — the top-right shows
-   relay · N, it stays collapsed until clicked, and clicking inside it
+   `relay · N`, it stays collapsed until clicked, and clicking inside it
    doesn't navigate. Copy produces the failure list.
-8. Real-path hosts: /https://react.dev stays on the page (no redirect to a
-   broken https:/react.dev) and shows / in the address bar; a GitHub repo
+8. Real-path hosts: `/https://react.dev` stays on the page (no redirect to a
+   broken `https:/react.dev`) and shows `/` in the address bar; a GitHub repo
    opens its search-filter and "…" menus, and a GitHub search shows the real
-   URL in the panel's page: row; /https://www.bbc.com/news renders without
+   URL in the panel's `page:` row; `/https://www.bbc.com/news` renders without
    the "client-side exception" screen. Reload on a non-root real-path page
    lands back on the same site. A host outside the list (for example
-   gist.github.com) keeps its embedded address.
-9. /https://bbc.com/news ends on www.bbc.com with the address bar matching
+   `gist.github.com`) keeps its embedded address.
+9. `/https://bbc.com/news` ends on `www.bbc.com` with the address bar matching
    the final URL (redirect-follow check).
+10. `/__relay_debug` shows "Relay debug mode: ON"; on any proxied page the
+    `relay` button is then present from load, and it keeps entries from the
+    previous page after a navigation. `/__relay_debug?on=0` turns it off.
 
 ---
 
-Limitations
+## Limitations
 
-· CAPTCHAs (reCAPTCHA, hCaptcha, Turnstile) generally will not work. They
+- **CAPTCHAs (reCAPTCHA, hCaptcha, Turnstile) generally will not work.** They
   validate the page's origin and are designed to detect embedding and proxying,
   which is exactly what a relay is. This is not fixed and a general fix is not
   expected. The diagnostic panel will show which requests fail.
-· No session cookies are forwarded, so logging into sites does not work
-  and logged-in-only content renders as signed out. Upstream Set-Cookie
+- **No session cookies are forwarded**, so logging into sites does not work
+  and logged-in-only content renders as signed out. Upstream `Set-Cookie`
   headers are stripped too, so nothing accumulates on the relay's own origin
-  either. (The one exception is the relay's own __relay_ctx cookie in
+  either. (The one exception is the relay's own `__relay_ctx` cookie in
   real-path mode, which is never sent upstream.)
-· POST forms are not proxied (they submit straight to the real site).
-  fetch/XHR POSTs are proxied.
-· Target sites can block Cloudflare's IP ranges (some anti-bot systems do).
+- **POST forms are not proxied** (they submit straight to the real site).
+  `fetch`/XHR POSTs *are* proxied.
+- **Target sites can block Cloudflare's IP ranges** (some anti-bot systems do).
   No code change can fix that; the diagnostic panel shows the status codes.
-· Free-plan WebSocket idle timeout is 100 s. An idle game or chat
+- **Free-plan WebSocket idle timeout is 100 s.** An idle game or chat
   connection can drop. A keepalive was deliberately not added: it would inject
   unexpected messages into the real application protocol.
-· All proxied sites share the relay origin, so their
-  localStorage/sessionStorage can collide. Per-target storage isolation
+- **All proxied sites share the relay origin**, so their
+  `localStorage`/`sessionStorage` can collide. Per-target storage isolation
   is deliberately deferred.
-· Real-path mode trade-offs. The address bar on those hosts carries no
+- **Real-path mode trade-offs.** The address bar on those hosts carries no
   target host, so a copied bar URL does not work (use the panel's Link
-  button). The __relay_ctx cookie is shared between tabs, so reloading an
+  button). The `__relay_ctx` cookie is shared between tabs, so reloading an
   older real-path tab after opening a different real-path site in another tab
-  can land on the wrong site. Reloading a site's root page (/) lands on the
+  can land on the wrong site. Reloading a site's root page (`/`) lands on the
   relay homepage. Sites that read their origin or full URL, not just the path,
   can still misbehave.
-· Some sites cannot work at all under path embedding and are not fixed by
+- **Bot-protected and cookie-dependent services** (AI chat endpoints such as
+  duck.ai's, which answer `418` and ask to "verify you're human" over and
+  over) generally will not work. Their checks rely on cookies set after a
+  challenge is passed — and the relay forwards none and strips every
+  `Set-Cookie`, so each request looks like a first visit — and on fingerprint
+  and datacenter-IP signals that a proxy cannot reproduce. Supporting these
+  would need a per-target cookie jar, which is a different security model
+  from the current anonymous, cacheable one.
+- **Some sites cannot work at all under path embedding** and are not fixed by
   the above: anything that needs a first-party session, validates its own
   origin (consent and anti-bot SDKs often do), or loads origin-locked
   resources.
-· Attribute hooks match lowercase names only (getAttribute("HREF") is not
+- Attribute hooks match lowercase names only (`getAttribute("HREF")` is not
   intercepted).
-· postMessage target origins are widened to *, trading the page author's
+- `postMessage` target origins are widened to `*`, trading the page author's
   origin check for cross-frame messages that work under the relay.
-· The password gate has no rate limiting, a non-timing-safe comparison, and
-  recomputes the password hash on every request. The Secure session cookie
+- The password gate has no rate limiting, a non-timing-safe comparison, and
+  recomputes the password hash on every request. The `Secure` session cookie
   loops the login on plain-HTTP local development. It keeps casual visitors
   and crawlers out; it is not hardened access control.
-· This is an open relay for anyone with the URL unless PASSWORD is set.
+- This is an open relay for anyone with the URL unless `PASSWORD` is set.
   Consider a target allow-list and rate limiting before exposing it publicly.
-
-```
