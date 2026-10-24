@@ -2349,7 +2349,20 @@ class ScriptInjector {
           return prepared.then(function(p) {
             return origFetch.call(self, p, init);
           }).then(function(res) {
-            if (!res.ok) relayLogFailure(method, originalForLog, res.status);
+            if (!res.ok) {
+              if (RELAY_DEBUG) {
+                // Debug mode: include the start of the response body. Anti-bot
+                // endpoints explain themselves there (a 418 with a challenge
+                // type, a rate-limit code, ...).
+                try {
+                  res.clone().text().then(function(t) {
+                    relayLogFailure(method, originalForLog, res.status, t.slice(0, 200));
+                  }, function() { relayLogFailure(method, originalForLog, res.status); });
+                } catch (e) { relayLogFailure(method, originalForLog, res.status); }
+              } else {
+                relayLogFailure(method, originalForLog, res.status);
+              }
+            }
             return res;
           }, function(err) {
             relayLogFailure(method, originalForLog, 'ERR', err && err.message);
@@ -2374,7 +2387,13 @@ class ScriptInjector {
           var xhr = this;
           xhr.addEventListener('loadend', function() {
             if (xhr.status === 0 || xhr.status >= 400) {
-              relayLogFailure(xhr.__relayMethod || '?', xhr.__relayUrl || '?', xhr.status || 'ERR');
+              var xhrNote = '';
+              if (RELAY_DEBUG) {
+                try {
+                  if (!xhr.responseType || xhr.responseType === 'text') xhrNote = String(xhr.responseText || '').slice(0, 200);
+                } catch (e) {}
+              }
+              relayLogFailure(xhr.__relayMethod || '?', xhr.__relayUrl || '?', xhr.status || 'ERR', xhrNote);
             }
           });
           return origSend.apply(this, arguments);
@@ -2875,4 +2894,4 @@ class ScriptInjector {
       { html: true }
     );
   }
-                                 }
+}
