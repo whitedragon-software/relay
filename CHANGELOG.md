@@ -1,5 +1,85 @@
 # Changelog
 
+## v0.11.0
+
+### Added
+- Cookie jar, so logins and sessions work (`COOKIE_JAR`, on by default; set it
+  to `false` to turn the jar off). The Worker has no storage, so the jar lives
+  in the visitor's browser as cookies on the relay's origin, **one relay
+  cookie per upstream cookie**: `__rj_h.<host>.<path>.<name>` (HttpOnly) or
+  `__rj_s.<host>.<path>.<name>` (script-visible), each part base64url, with a
+  base64url JSON value `[value, expiresMs, secure, hostOnly, sameSite]`. One
+  cookie per upstream cookie matters: parallel responses (a page and its XHRs
+  all setting cookies at once) each touch only their own cookies, so none can
+  overwrite another's — a single blob per site would lose cookies, and with
+  them logins, to that race. On each request the matching cookies become an
+  ordinary `Cookie` header for the target (host-only vs. `Domain`, `Path`,
+  `Secure`, expiry and `SameSite` honoured, with cross-site requests judged
+  against the page's site, and `__Secure-`/`__Host-` prefixes enforced); each
+  upstream `Set-Cookie` becomes one relay `Set-Cookie`, set or expire. A small
+  list of multi-label suffixes stands in for the public-suffix list, so a site
+  cannot set a cookie for `co.uk`. Limits: about 3.8 KB per cookie, 6 KB per
+  site and 10 KB in total — past that the largest untouched sites are expired,
+  so the browser's `Cookie` header can never grow past what Cloudflare accepts
+  and lock the visitor out of the relay.
+- Login support. POST forms now submit through the relay: the Worker rewrites
+  `action` (and `formaction`) to the proxied URL, and the injected script does
+  the same for forms inserted or changed by JavaScript. Previously a relative
+  action landed on the bare relay origin and an absolute one went straight to
+  the real site, skipping the relay and its cookies. GET forms are unchanged. A
+  form with no `action` posts to the page's own (already proxied) URL.
+- Redirects are handed to the browser while the jar is on: the Worker makes one
+  upstream request, rewrites a 3xx `Location` to stay inside the relay and
+  returns it with that hop's cookies. The browser follows it as it would on the
+  real site, so method and body semantics, the address bar and one-shot content
+  (a flash message after login) behave naturally, and cookies set on a redirect
+  are stored before the next hop — the usual login flow is POST, then 302 with
+  `Set-Cookie`, then the page.
+- `document.cookie` shim in the injected script: reads return the
+  script-visible cookies for the page's real host, writes update the matching
+  relay cookie, and HttpOnly cookies are never exposed. The relay's own cookies
+  (`__relay_ctx`, `__relay_debug`) go through the native accessors.
+- WebSocket handshakes carry the target's cookies.
+- `/cookies`: a cookie manager that lists the sites with cookies in this
+  browser — cookie **names** only, never values, with the HttpOnly ones marked —
+  and clears one site or all of them. Linked from the homepage footer.
+- Homepage: a visible **Log out** button in the header, next to the theme
+  toggle, in addition to the footer link. Both appear only when `PASSWORD` is
+  set (there is no session to end otherwise).
+- In debug mode, navigations that are form submissions are labelled `form
+  submit` in the log.
+
+### Changed
+- Login and logout moved to `/login` and `/logout` (previously
+  `/__relay_login` and `/__relay_logout`, which now redirect there). These are
+  common names on other sites, so a request for either — GET or POST — whose
+  `Referer` is a proxied page is treated as that site's escaped link and
+  repaired like any other; typed or bookmarked visits, the relay's own login
+  form (posted from `/login`) and the login redirect (`?redirect=`) are the
+  relay's. The relay's Service Worker leaves `/login`, `/logout` and `/cookies`
+  alone and lets the server decide.
+- Caching with the jar on: requests that carry jar cookies bypass every cache
+  (Cloudflare's fetch cache and the relay's edge cache); `cacheEverything`
+  applies only to static assets (`script`/`style`/`image`/`font`), because a
+  first visit can set a cookie that a cached copy would never replay to the
+  next visitor; HTML is never stored in the relay's edge cache, because a login
+  page carries a CSRF token that a cached copy would hand to the next visitor;
+  HTML built with a visitor's cookies is sent `Cache-Control: private,
+  no-cache`. With the jar off, caching is exactly as before.
+- Escape-recovery redirects (a request that reached the bare relay origin, or
+  a collapsed `/https:/host/…` path) answer 307 for anything but GET/HEAD, in
+  the Worker and the Service Worker, so a POST keeps its method and body
+  instead of being downgraded to a GET by a 302.
+- POST forms go through the relay even with the jar off (without cookies).
+
+### Fixed
+- POST forms bypassed the relay (see Added), which made logins impossible.
+- Cookies set on a redirect hop were lost, because the Worker followed
+  redirects itself with a throwaway cookie view (see Added).
+- A POST that escaped to the relay origin was turned into a GET (see Changed).
+
+## v0.10.0
+
 ## v0.10.0
 
 ### Added
