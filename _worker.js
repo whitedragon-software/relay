@@ -67,6 +67,55 @@ const DEBUG_PATH = '/__relay_debug';
 const BLOCKED_HOSTS = /^$/;
 const COOKIES_PATH = '/cookies';
 
+// Derived-host aliasing. Some sites build server names from location.hostname
+// - Proton turns account.proton.me into account-api.proton.me - and under the
+// relay location.hostname is the RELAY'S host, so the page asks for names like
+// relay-api.<your domain>, which do not exist. When the page's real site is
+// known (from the Referer), such a name is translated by applying the same
+// derivation to the page's real host:
+//   <relay label>-<suffix>.<relay rest>  ->  <page label>-<suffix>.<page rest>
+//   <prefix>.<relay host>                ->  <prefix>.<page host>
+// (relay-api.whitedragon.us.ci seen from account.proton.me becomes
+// account-api.proton.me). Set to false to turn it off.
+const DERIVED_HOST_ALIASES = true;
+
+function mapDerivedHost(targetHost, relayHost, pageHost) {
+  if (!targetHost || !relayHost || !pageHost || targetHost === relayHost || pageHost === relayHost) return null;
+  const rd = relayHost.indexOf('.');
+  const pd = pageHost.indexOf('.');
+  if (rd < 1 || pd < 1) return null;
+  const rLabel = relayHost.slice(0, rd);
+  const rRest = relayHost.slice(rd + 1);
+  const pLabel = pageHost.slice(0, pd);
+  const pRest = pageHost.slice(pd + 1);
+  if (targetHost.endsWith('.' + relayHost)) return targetHost.slice(0, targetHost.length - relayHost.length) + pageHost;
+  const td = targetHost.indexOf('.');
+  if (td > rLabel.length && targetHost.slice(td + 1) === rRest) {
+    const tLabel = targetHost.slice(0, td);
+    if (tLabel.startsWith(rLabel + '-')) return pLabel + tLabel.slice(rLabel.length) + '.' + pRest;
+  }
+  return null;
+}
+
+// A hint for the error page when an address is a name under the relay's own
+// domain that nothing could translate.
+function derivedHostHint(targetHost, proxyOrigin) {
+  try {
+    const relayHost = new URL(proxyOrigin).hostname.toLowerCase();
+    const rd = relayHost.indexOf('.');
+    if (rd < 1) return '';
+    const rest = relayHost.slice(rd + 1);
+    const h = String(targetHost).toLowerCase();
+    if (h !== relayHost && h.endsWith('.' + rest)) {
+      return 'This name sits under the relay\'s own domain (' + rest + '). Some pages build server names from the address they are shown at, ' +
+        'and the relay can only translate those when it knows which site the page really belongs to.';
+    }
+  } catch {
+    // no hint
+  }
+  return '';
+}
+
 // ---- Cookie jar -------------------------------------------------------------
 // Per-site cookies, so logins and sessions work. The Worker has no storage of
 // its own, so the jar lives in the VISITOR'S BROWSER as cookies on the relay's
@@ -685,6 +734,15 @@ const HOME_HTML = `<!doctype html>
     transition: border-color 0.15s ease;
   }
   .header-btn:hover { border-color: var(--text-dim); }
+  button.header-btn { cursor: pointer; }
+  .header-form { margin: 0; }
+  .note {
+    margin: 28px 0 0;
+    max-width: 52ch;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-dim);
+  }
 
   .eyebrow {
     font-family: 'JetBrains Mono', monospace;
@@ -855,6 +913,7 @@ const HOME_HTML = `<!doctype html>
         <div class="line"><span class="pulse" style="animation-delay: 1.6s;"></span></div>
         <div class="node"><span class="sq"></span><span class="label">target</span></div>
       </div>
+      __RELAY_NOTICE__
     </main>
 
     <footer>
@@ -1651,10 +1710,22 @@ export default {
       const footerLinks = [];
       if (hasPassword) footerLinks.push(`<a href="${LOGOUT_PATH}" style="color:inherit;">log out</a>`);
       if (COOKIE_JAR) footerLinks.push(`<a href="${COOKIES_PATH}" style="color:inherit;">cookies</a>`);
-      const headerActions = hasPassword ? `<a class="header-btn" href="${LOGOUT_PATH}">Log out</a>` : '';
+      // Header controls. "Log out" ends the relay session and exists only with a
+      // password. "Sign out of sites" clears every site cookie in this browser
+      // (the sessions the cookie jar holds) in one press; "Cookies" is the manager.
+      const headerButtons = [];
+      if (COOKIE_JAR) {
+        headerButtons.push(`<a class="header-btn" href="${COOKIES_PATH}">Cookies</a>`);
+        headerButtons.push(`<form class="header-form" method="POST" action="${COOKIES_PATH}"><input type="hidden" name="host" value="*"><button class="header-btn" type="submit" title="Clear every site's cookies in this browser">Sign out of sites</button></form>`);
+      }
+      if (hasPassword) headerButtons.push(`<a class="header-btn" href="${LOGOUT_PATH}">Log out</a>`);
+      const notice = hasPassword
+        ? ''
+        : '<p class="note">Password protection is off, so anyone with this address can use this relay, and there is no relay login to log out of. Set the <code>PASSWORD</code> secret to turn on a login — the <b>Log out</b> button appears here once it is set.</p>';
       const homeHtml = HOME_HTML
         .replace('__RELAY_LOGOUT_LINK__', footerLinks.map((l) => ' · ' + l).join(''))
-        .replace('__RELAY_HEADER_ACTIONS__', headerActions);
+        .replace('__RELAY_HEADER_ACTIONS__', headerButtons.join(''))
+        .replace('__RELAY_NOTICE__', notice);
       return new Response(homeHtml, {
         status: 200,
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
@@ -1688,6 +1759,29 @@ export default {
       return errorResponse(proxyOrigin, 400, 'Refusing to proxy itself', "This address points back at the relay's own origin, which would cause it to fetch itself.", null, parsedTarget.href);
     }
 
+    // Who is asking: the real site of the page that made this request.
+    const pageCtx = resolvePageContext(request, proxyOrigin);
+
+    // Names a page derived from the relay's hostname (see DERIVED_HOST_ALIASES).
+    let aliased = false;
+    if (DERIVED_HOST_ALIASES && pageCtx.origin) {
+      try {
+        const mapped = mapDerivedHost(
+          parsedTarget.hostname.toLowerCase(),
+          new URL(proxyOrigin).hostname.toLowerCase(),
+          new URL(pageCtx.origin).hostname.toLowerCase()
+        );
+        if (mapped) {
+          const translated = new URL(parsedTarget.href);
+          translated.hostname = mapped;
+          parsedTarget = translated;
+          aliased = true;
+        }
+      } catch {
+        // leave the target as it was
+      }
+    }
+
     // Cloudflare analytics/speculation endpoints on the TARGET's domain (RUM
     // beacons, Speculation Rules) have no meaning through the relay and only
     // produce 404/405 noise. Acknowledge and drop them.
@@ -1702,7 +1796,6 @@ export default {
     // Cookie jar (see COOKIE_JAR): this visitor's cookies for the target, as an
     // ordinary Cookie header. A request carrying cookies is personalized, so
     // it bypasses every cache below.
-    const pageCtx = resolvePageContext(request, proxyOrigin);
     const jarOn = COOKIE_JAR;
     const jar = jarOn ? loadJar(request, parsedTarget.hostname.toLowerCase()) : null;
     let jarCtx = null;
@@ -1737,7 +1830,7 @@ export default {
     // Built only when it can be used, and from the URL alone: the old
     // `new Request(url, request)` copied every header of every request.
     const cacheKey = cacheable
-      ? new Request(request.url + (url.search ? '&' : '?') + '__relay_acc=' + encodeURIComponent(acceptToken))
+      ? new Request((aliased ? proxyOrigin + '/' + parsedTarget.href : request.url) + (url.search ? '&' : '?') + '__relay_acc=' + encodeURIComponent(acceptToken))
       : null;
     // With the jar on, HTML is never stored, so a document or an API call can
     // never hit the cache - skip the lookup (a network round trip) for them.
@@ -1801,7 +1894,7 @@ export default {
         upstream = await fetchUpstream(upstreamHref, upstreamInit);
       }
     } catch (error) {
-      return errorResponse(proxyOrigin, 502, "Couldn't reach that address", 'The request to the target failed before any response came back.', error.message, parsedTarget.href);
+      return errorResponse(proxyOrigin, 502, "Couldn't reach that address", 'The request to the target failed before any response came back.', (derivedHostHint(parsedTarget.hostname, proxyOrigin) + ' ' + error.message).trim(), parsedTarget.href);
     }
 
     // Cloudflare's own edge — not the target site — returns these statuses
@@ -1811,7 +1904,7 @@ export default {
     // it were the real page. Show our own explanation instead.
     const CF_EDGE_ERROR_STATUSES = new Set([520, 521, 522, 523, 524, 525, 526, 527, 530]);
     if (CF_EDGE_ERROR_STATUSES.has(upstream.status)) {
-      return errorResponse(proxyOrigin, 502, "Couldn't reach that address", "The target domain didn't respond — it may not exist, or is temporarily unreachable.", 'Double-check the address for typos.', parsedTarget.href);
+      return errorResponse(proxyOrigin, 502, "Couldn't reach that address", "The target domain didn't respond — it may not exist, or is temporarily unreachable.", derivedHostHint(parsedTarget.hostname, proxyOrigin) || 'Double-check the address for typos.', parsedTarget.href);
     }
 
     // Cookie changes from this response, ready to hand to the browser.
@@ -2729,6 +2822,54 @@ class ScriptInjector {
         return s.replace(/^(https?:)\\/(?!\\/)/i, '$1//');
       }
 
+      // --- Captcha widgets ---------------------------------------------------
+      // A captcha checks WHICH SITE is hosting it. Its widget URL carries that
+      // site's name (hCaptcha: host= in the fragment or query; reCAPTCHA: co=,
+      // the base64 of the origin), and the page's script fills it in from
+      // location - which under the relay is the RELAY'S address. The provider
+      // then rejects the sitekey ("invalid domain"). For URLs of the well-known
+      // captcha providers, swap the relay's name for the embedding page's REAL
+      // one. Whether a provider then accepts a solve is up to it (many also
+      // judge the network the request comes from), but this removes the
+      // mechanical reason they cannot.
+      var RELAY_HOST = '';
+      try { RELAY_HOST = new URL(proxyOrigin).host; } catch (e) {}
+      function relayIsCaptchaUrl(u) {
+        return /^https?:\\/\\/([^\\/?#]*\\.)?(hcaptcha\\.com|challenges\\.cloudflare\\.com|arkoselabs\\.com|funcaptcha\\.com|geetest\\.com|geevisit\\.com|friendlycaptcha\\.com|captcha-delivery\\.com|datadome\\.co|recaptcha\\.net)(\\/|\\?|#|$)/i.test(u) ||
+          /^https?:\\/\\/(www\\.)?(google\\.com|gstatic\\.com)\\/recaptcha\\//i.test(u);
+      }
+      function relayFixCaptchaUrl(abs) {
+        try {
+          if (!RELAY_HOST || (abs.indexOf(RELAY_HOST) === -1 && abs.indexOf('co=') === -1) || !relayIsCaptchaUrl(abs)) return abs;
+          var q = abs.search(/[?#]/);
+          if (q < 0) return abs;
+          var base = new URL(realBase());
+          var tail = abs.slice(q).replace(/([?&#](?:host|hostname|domain|parent|origin)=)([^&#]*)/gi, function(m, pre, val) {
+            var dv;
+            try { dv = decodeURIComponent(val); } catch (e) { return m; }
+            if (dv === proxyOrigin || dv.indexOf(proxyOrigin + '/') === 0) return pre + encodeURIComponent(base.origin);
+            if (dv === RELAY_HOST) return pre + encodeURIComponent(base.host);
+            return m;
+          });
+          tail = tail.replace(/([?&#]co=)([A-Za-z0-9_.%-]+)/, function(m, pre, val) {
+            try {
+              var b = decodeURIComponent(val).replace(/\\./g, '=').replace(/-/g, '+').replace(/_/g, '/');
+              while (b.length % 4) b += '=';
+              var plain = atob(b);
+              var rel = new URL(proxyOrigin);
+              var relPort = rel.port || (rel.protocol === 'https:' ? '443' : '80');
+              if (plain !== rel.protocol + '//' + rel.hostname + ':' + relPort) return m;
+              var rp = base.port || (base.protocol === 'https:' ? '443' : '80');
+              var real = base.protocol + '//' + base.hostname + ':' + rp;
+              return pre + btoa(real).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '.');
+            } catch (e) { return m; }
+          });
+          return abs.slice(0, q) + tail;
+        } catch (e) {
+          return abs;
+        }
+      }
+
       function toProxied(raw) {
         try {
           if (typeof raw !== 'string' || !raw) return raw;
@@ -2763,6 +2904,7 @@ class ScriptInjector {
           }
           var decodedTarget = decodeTrackingRedirectClient(raw, realBase());
           var abs = new URL(decodedTarget || raw, realBase()).href;
+          abs = relayFixCaptchaUrl(abs);
           return proxyOrigin + '/' + abs;
         } catch (e) {
           return raw;
@@ -3022,6 +3164,7 @@ class ScriptInjector {
           // POST /cdn-cgi/rum) 404s through the relay by design — it is
           // never a site defect, only log noise.
           if (typeof realUrl === 'string' && realUrl.indexOf('/cdn-cgi/') !== -1) return;
+          if (!note && typeof realUrl === 'string' && relayIsCaptchaUrl(realUrl)) note = 'captcha provider: may not complete through the relay';
           relayEnsurePanel();
           __relayFailures.unshift({ method: method, url: realUrl, status: status, note: note || '' });
           if (__relayFailures.length > MAX_LOGGED) __relayFailures.pop();
@@ -3361,6 +3504,61 @@ class ScriptInjector {
               return w;
             },
             configurable: true
+          });
+        }
+      } catch (e) {}
+
+      // Every page and frame the relay serves lives on the relay's origin, so
+      // event.origin on a message between them is always the relay's - and the
+      // origin checks that widgets, captchas, payment and sign-in frames run on
+      // incoming messages ("is this really https://hcaptcha.com?") all fail. A
+      // message from a frame of a different REAL site now reports that site's
+      // real origin; from a frame of the page's own real site it keeps the relay
+      // origin (what the page's own location.origin says). Names the page
+      // derived from the relay's host (see DERIVED_HOST_ALIASES) are mapped back
+      // to the derived form the page expects.
+      function relayVirtualOrigin(realOrigin) {
+        try {
+          var u = new URL(realOrigin);
+          var host = u.hostname.toLowerCase();
+          var page = new URL(realBase()).hostname.toLowerCase();
+          var rh = location.hostname.toLowerCase();
+          var pd = page.indexOf('.'), rd = rh.indexOf('.');
+          if (pd < 1 || rd < 1 || host === page) return realOrigin;
+          var pLabel = page.slice(0, pd), pRest = page.slice(pd + 1), rLabel = rh.slice(0, rd), rRest = rh.slice(rd + 1);
+          var port = u.port ? ':' + u.port : '';
+          if (host.slice(-(page.length + 1)) === '.' + page) return u.protocol + '//' + host.slice(0, host.length - page.length) + rh + port;
+          var hd = host.indexOf('.');
+          if (hd > pLabel.length && host.slice(hd + 1) === pRest && host.slice(0, hd).indexOf(pLabel + '-') === 0) {
+            return u.protocol + '//' + rLabel + host.slice(0, hd).slice(pLabel.length) + '.' + rRest + port;
+          }
+        } catch (e) {}
+        return realOrigin;
+      }
+      try {
+        var relayMeDesc = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'origin');
+        if (relayMeDesc && relayMeDesc.get) {
+          Object.defineProperty(MessageEvent.prototype, 'origin', {
+            get: function() {
+              var o = relayMeDesc.get.call(this);
+              try {
+                if (o !== proxyOrigin) return o;
+                var src = this.source;
+                if (!src || src === window) return o;
+                var b = src.document && src.document.baseURI;
+                var pfx = proxyOrigin + '/';
+                if (!b || b.indexOf(pfx) !== 0) return o;
+                var rest = b.slice(pfx.length);
+                if (!/^https?:\\/\\//i.test(rest)) return o;
+                var realOrigin = new URL(rest).origin;
+                if (realOrigin === new URL(realBase()).origin) return o;
+                return relayVirtualOrigin(realOrigin);
+              } catch (e) {
+                return o;
+              }
+            },
+            configurable: true,
+            enumerable: relayMeDesc.enumerable
           });
         }
       } catch (e) {}
@@ -3708,4 +3906,4 @@ class ScriptInjector {
     </script>
   `;
   }
-                       }
+}
