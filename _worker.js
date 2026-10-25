@@ -58,6 +58,13 @@ const SW_PATH = '/__proxy_sw.js';
 const REAL_PATH_HOSTS = /^(www\.)?(bbc\.com|bbc\.co\.uk|github\.com|react\.dev)$/i;
 const CTX_COOKIE = '__relay_ctx';
 const DEBUG_PATH = '/__relay_debug';
+// OPTIONAL speed switch, OFF by default: hostnames matching this are answered
+// with an empty 204 instead of being fetched, which removes analytics and ad
+// requests (each one is a full Worker round trip) from every page. Blocking
+// can break pages that expect these scripts to exist, which is why it is off.
+// To try it, replace /^$/ with something like:
+//   /(^|\.)(google-analytics\.com|googletagmanager\.com|doubleclick\.net|googlesyndication\.com|facebook\.net|hotjar\.com|scorecardresearch\.com)$/
+const BLOCKED_HOSTS = /^$/;
 const COOKIES_PATH = '/cookies';
 
 // ---- Cookie jar -------------------------------------------------------------
@@ -168,12 +175,16 @@ function jarExpireHeader(name) {
   return name + '=; Path=/; Max-Age=0; Secure; SameSite=Lax';
 }
 
-function loadJar(request) {
+// `forHost` (a lowercase hostname) skips decoding the cookies of other sites -
+// they still count toward the size budget, but a visitor with many sites'
+// cookies does not pay to decode them all on every request.
+function loadJar(request, forHost) {
   const jar = { records: [], raw: new Map(), ops: [], touched: new Set() };
   for (const [rawName, value] of parseCookieHeader(request.headers.get('Cookie'))) {
     const meta = parseJarName(rawName);
     if (!meta) continue;
     jar.raw.set(rawName, { size: rawName.length + value.length + 3, key: meta.key });
+    if (forHost && !(forHost === meta.key || forHost.endsWith('.' + meta.key))) continue;
     const json = b64uDec(value);
     if (!json) continue;
     let v;
@@ -510,6 +521,18 @@ const SW_SCRIPT = `
 // leave a browser running stale logic indefinitely, causing confusing
 // behavior that only a hard reload (forcing a fresh update check) fixes.
 self.addEventListener('install', (event) => {
+  // Chromium's static routing API: a request whose path already starts with an
+  // embedded http(s) URL never needs this worker, so send it straight to the
+  // network instead of waking the worker for every single subresource.
+  // Browsers without the API ignore this and behave exactly as before.
+  try {
+    if (typeof event.addRoutes === 'function') {
+      const routed = event.addRoutes({ condition: { urlPattern: { pathname: '/http*' } }, source: 'network' });
+      if (routed && typeof routed.catch === 'function') routed.catch(() => {});
+    }
+  } catch (e) {
+    // the routing API is optional
+  }
   event.waitUntil(self.skipWaiting());
 });
 self.addEventListener('activate', (event) => {
@@ -1234,9 +1257,15 @@ function safeRedirectPath(r) {
 
 // The cookie stores a hash of the password, not the password itself, so the
 // raw secret isn't sitting in a cookie if it's ever exposed some other way.
+// Memoized: with a password set this runs on every request, and the answer
+// only changes when the secret does.
+let relayPwdHashCache = { pwd: null, hash: null };
 async function relayHashPassword(pwd) {
+  if (relayPwdHashCache.pwd === pwd) return relayPwdHashCache.hash;
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pwd));
-  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  const hash = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  relayPwdHashCache = { pwd, hash };
+  return hash;
 }
 
 function relayGetCookie(request, name) {
@@ -1343,7 +1372,8 @@ async function handleWebSocketUpgrade(request, url, proxyOrigin) {
   // authenticate by cookie work.
   if (COOKIE_JAR) {
     try {
-      const wsCookies = jarCookieHeader(loadJar(request), new URL(httpEquivalent), false, false);
+      const wsTarget = new URL(httpEquivalent);
+      const wsCookies = jarCookieHeader(loadJar(request, wsTarget.hostname.toLowerCase()), wsTarget, false, false);
       if (wsCookies) upstreamHeaders.set('Cookie', wsCookies);
     } catch {
       // no cookies for this socket
@@ -1665,19 +1695,22 @@ export default {
       return new Response(null, { status: 204 });
     }
 
+    if (BLOCKED_HOSTS.test(parsedTarget.hostname)) return new Response(null, { status: 204 });
+
     // Edge cache: identical proxied requests skip origin + rewriting entirely.
     // GET-only — the Cache API throws on non-GET requests.
     // Cookie jar (see COOKIE_JAR): this visitor's cookies for the target, as an
     // ordinary Cookie header. A request carrying cookies is personalized, so
     // it bypasses every cache below.
+    const pageCtx = resolvePageContext(request, proxyOrigin);
     const jarOn = COOKIE_JAR;
-    const jar = jarOn ? loadJar(request) : null;
+    const jar = jarOn ? loadJar(request, parsedTarget.hostname.toLowerCase()) : null;
     let jarCtx = null;
     let cookieHeader = '';
     if (jarOn) {
       let pageSite = '';
       try {
-        const po = resolvePageContext(request, proxyOrigin).origin;
+        const po = pageCtx.origin;
         if (po) pageSite = siteOf(new URL(po).hostname);
       } catch {
         // unknown page: treated as same-site
@@ -1701,11 +1734,17 @@ export default {
     // the full TTL. The token exists only in the cache key — the upstream
     // fetch still uses the untouched target URL.
     const acceptToken = request.headers.get('Accept') || 'no-accept';
-    const cacheKey = new Request(
-      request.url + (url.search ? '&' : '?') + '__relay_acc=' + encodeURIComponent(acceptToken),
-      request
-    );
-    if (cacheable) {
+    // Built only when it can be used, and from the URL alone: the old
+    // `new Request(url, request)` copied every header of every request.
+    const cacheKey = cacheable
+      ? new Request(request.url + (url.search ? '&' : '?') + '__relay_acc=' + encodeURIComponent(acceptToken))
+      : null;
+    // With the jar on, HTML is never stored, so a document or an API call can
+    // never hit the cache - skip the lookup (a network round trip) for them.
+    const fetchDest = request.headers.get('Sec-Fetch-Dest') || '';
+    const cacheLookup = cacheable &&
+      !(jarOn && /^(document|iframe|frame|empty|embed|object|worker|sharedworker|serviceworker|manifest|report|xslt|fencedframe)$/.test(fetchDest));
+    if (cacheLookup) {
       const cached = await cache.match(cacheKey);
       if (cached) return cached;
     }
@@ -1717,7 +1756,7 @@ export default {
 
     const upstreamInit = {
       method: request.method,
-      headers: buildUpstreamHeaders(request, proxyOrigin, parsedTarget.origin),
+      headers: buildUpstreamHeaders(request, proxyOrigin, parsedTarget.origin, pageCtx),
       redirect: 'follow',
       // cacheEverything is only safe for anonymous responses, so it is off
       // for any request that carries jar cookies and — once the cookie jar is
@@ -1731,7 +1770,7 @@ export default {
       // replayed from Cloudflare's cache to every visitor for the full
       // TTL. 1s on the error ranges is effectively "don't cache" without
       // relying on 0-TTL handling.
-      cf: (noEdgeCache || cookieHeader || (jarOn && !/^(script|style|image|font)$/.test(request.headers.get('Sec-Fetch-Dest') || '')))
+      cf: (noEdgeCache || cookieHeader || (jarOn && !/^(script|style|image|font)$/.test(fetchDest)))
         ? undefined
         : { cacheEverything: true, cacheTtlByStatus: { '200-299': 120, '400-499': 1, '500-599': 1 } }
     };
@@ -1746,7 +1785,7 @@ export default {
       upstreamInit.duplex = 'half';
     }
 
-    const upstreamHref = stripProxyFromQuery(parsedTarget, proxyOrigin, resolvePageContext(request, proxyOrigin).origin);
+    const upstreamHref = stripProxyFromQuery(parsedTarget, proxyOrigin, pageCtx.origin);
 
     let upstream;
     try {
@@ -1954,6 +1993,10 @@ function proxify(absoluteUrl, proxyOrigin) {
 // forwarding. Query string only; everything else is untouched.
 function stripProxyFromQuery(parsed, proxyOrigin, pageOrigin) {
   if (!parsed.search) return parsed.href;
+  // Nearly every request: the query never mentions the relay, so skip the
+  // regex work below. (The relay host appears verbatim in both the plain and
+  // the percent-encoded forms of its origin.)
+  if (!parsed.search.includes(proxyOrigin.replace(/^https?:\/\//, ''))) return parsed.href;
   const esc = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const lowerHex = (v) => v.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
   const encWrapped = encodeURIComponent(proxyOrigin + '/');
@@ -2006,7 +2049,7 @@ function recoverRealUrl(headerValue, proxyOrigin) {
   }
 }
 
-function buildUpstreamHeaders(request, proxyOrigin, targetOrigin) {
+function buildUpstreamHeaders(request, proxyOrigin, targetOrigin, pageCtxArg) {
   const headers = new Headers();
   // Forward the REAL browser's own User-Agent rather than a fixed spoofed
   // string. This request's Sec-Ch-Ua/Sec-Fetch-* headers (forwarded below,
@@ -2035,7 +2078,7 @@ function buildUpstreamHeaders(request, proxyOrigin, targetOrigin) {
   // pages). A browser sends the PAGE's origin on cross-origin requests, which
   // media CDNs and CORS allow-lists check; fall back to the target's own
   // origin only when the page can't be determined.
-  const pageCtx = resolvePageContext(request, proxyOrigin);
+  const pageCtx = pageCtxArg || resolvePageContext(request, proxyOrigin);
   if (pageCtx.referer) headers.set('Referer', pageCtx.referer);
 
   if (request.headers.get('Origin')) {
@@ -2199,7 +2242,12 @@ function rewriteEmbeddedUrls(text, baseUrl, proxyOrigin) {
 // Decoding the real destination here and linking straight to it skips the
 // interstitial, and its escape, altogether. Falls through to the tracking
 // URL unchanged if no known pattern matches — never breaks a link.
+// Cheap pre-check: a tracking redirect has /ck/a, /url or /l as a whole path
+// segment, so anything else (nearly every link) skips the URL parse below.
+const TRACKING_HINT = /(^|\/)ck\/a(\?|#|$)|(^|\/)url(\?|#|$)|(^|\/)l(\/|\?|#|$)/i;
+
 function decodeTrackingRedirect(rawValue, baseUrl) {
+  if (!TRACKING_HINT.test(rawValue)) return null;
   let u;
   try {
     u = new URL(rawValue, baseUrl);
@@ -2240,6 +2288,18 @@ function decodeTrackingRedirect(rawValue, baseUrl) {
   return null;
 }
 
+// The page's base URL is the same for every link on it: parse it once.
+const BASE_URL_CACHE = new Map();
+function baseUrlObject(baseUrl) {
+  let u = BASE_URL_CACHE.get(baseUrl);
+  if (!u) {
+    u = new URL(baseUrl);
+    if (BASE_URL_CACHE.size >= 16) BASE_URL_CACHE.clear();
+    BASE_URL_CACHE.set(baseUrl, u);
+  }
+  return u;
+}
+
 function resolveAndProxy(value, baseUrl, proxyOrigin) {
   if (value === null || value === undefined) return null;
   // An empty src/href must not resolve to the page itself (<img src=""> would
@@ -2247,8 +2307,9 @@ function resolveAndProxy(value, baseUrl, proxyOrigin) {
   if (!value.trim()) return null;
   if (/^(javascript|data|mailto|tel|#)/i.test(value)) return null;
   try {
-    const target = decodeTrackingRedirect(value, baseUrl) || value;
-    const abs = new URL(target, baseUrl).href;
+    const base = baseUrlObject(baseUrl);
+    const target = decodeTrackingRedirect(value, base) || value;
+    const abs = new URL(target, base).href;
     return proxify(abs, proxyOrigin);
   } catch {
     return null;
@@ -2385,6 +2446,20 @@ class BaseTagInjector {
   }
 }
 
+// The injected script is the same for every page of a deployment, so it is
+// built and minified once per isolate and only the real path (a placeholder
+// token) is substituted per request. Minifying strips full-line comments and
+// indentation - about 45% of the source - which the browser would otherwise
+// download and parse on every page. It never touches a line that does not
+// start with `//`, and the script contains no multi-line string or block
+// comment, so it cannot change what the code does.
+const SPOOF_TOKEN = '"__RELAY_SPOOF_PATH__"';
+const INJECT_CACHE = new Map();
+
+function minifyInjected(code) {
+  return code.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('//')).join('\n');
+}
+
 class ScriptInjector {
   constructor(proxyOrigin, realPath, cookieJar) {
     this.proxyOrigin = proxyOrigin;
@@ -2392,13 +2467,23 @@ class ScriptInjector {
     this.cookieJar = !!cookieJar;
   }
   element(el) {
-    el.prepend(
-      `
+    const key = this.proxyOrigin + '|' + this.cookieJar;
+    let script = INJECT_CACHE.get(key);
+    if (!script) {
+      script = minifyInjected(this.scriptText());
+      if (INJECT_CACHE.size >= 8) INJECT_CACHE.clear();
+      INJECT_CACHE.set(key, script);
+    }
+    const pathLiteral = JSON.stringify(this.realPath).replace(/</g, '\\u003c');
+    el.prepend(script.replace(SPOOF_TOKEN, () => pathLiteral), { html: true });
+  }
+  scriptText() {
+    return `
     <script>
     (function() {
       var proxyOrigin = '${this.proxyOrigin}';
       // Real-path mode (see REAL_PATH_HOSTS on the server). Empty = normal mode.
-      var relaySpoofPath = ${JSON.stringify(this.realPath || '').replace(/</g, '\\u003c')};
+      var relaySpoofPath = "__RELAY_SPOOF_PATH__";
       var relaySpoofReal = '';
       // Cookie jar (see COOKIE_JAR on the server): document.cookie is replaced
       // by a shim over the jar cookies. Everything in this script that needs
@@ -3430,17 +3515,36 @@ class ScriptInjector {
           }
         } catch (e) {}
       }
-      setTimeout(relayScanForStaleLinks, 1500);
-      setTimeout(relayScanForStaleLinks, 4000);
-      setTimeout(relayScanForStaleLinks, 8000);
+      // Diagnostic only: run it when the browser is idle, never in the middle
+      // of the page's own work.
+      function relaySweepWhenIdle() {
+        if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(relayScanForStaleLinks, { timeout: 3000 });
+        else relayScanForStaleLinks();
+      }
+      setTimeout(relaySweepWhenIdle, 1500);
+      setTimeout(relaySweepWhenIdle, 4000);
+      setTimeout(relaySweepWhenIdle, 8000);
 
       if (typeof MutationObserver === 'function') {
         var relayObserver = new MutationObserver(function(mutations) {
+          var added = [];
           for (var i = 0; i < mutations.length; i++) {
             var addedNodes = mutations[i].addedNodes;
             for (var j = 0; j < addedNodes.length; j++) {
-              relayScanForUrlElements(addedNodes[j]);
+              if (addedNodes[j].nodeType === 1) added.push(addedNodes[j]);
             }
+          }
+          if (!added.length) return;
+          // A node whose ancestor was added in the same batch is covered by
+          // scanning that ancestor's subtree; scanning it again would make a
+          // large page's parse quadratic.
+          var batch = new Set(added);
+          for (var k = 0; k < added.length; k++) {
+            var covered = false;
+            for (var anc = added[k].parentNode; anc; anc = anc.parentNode) {
+              if (batch.has(anc)) { covered = true; break; }
+            }
+            if (!covered) relayScanForUrlElements(added[k]);
           }
         });
         relayObserver.observe(document.documentElement, { childList: true, subtree: true });
@@ -3602,8 +3706,6 @@ class ScriptInjector {
       } catch (e) {}
     })();
     </script>
-  `,
-      { html: true }
-    );
+  `;
   }
-  }
+                       }
