@@ -67,6 +67,84 @@ const DEBUG_PATH = '/__relay_debug';
 const BLOCKED_HOSTS = /^$/;
 const COOKIES_PATH = '/cookies';
 
+// ---- IP widget ----------------------------------------------------------------
+// A small widget on the homepage (and behind an "IP" button in the diagnostic
+// panel) showing the visitor's real IP, as Cloudflare sees it, and the IP that
+// sites see when the relay fetches for you. /__relay_ip returns both as JSON.
+//  - "you": the CF-Connecting-IP of this request, with the country and network
+//    Cloudflare derived from it.
+//  - "sites see": the relay's outbound address, found by asking an IP-echo
+//    service from inside the Worker (so it is what an outside site sees right
+//    now; Cloudflare may use several outbound addresses, so it can vary).
+//    The lookup runs in the background, never blocks a page, and is cached for
+//    a minute. The echo services only ever see the Worker's own address.
+// PRIVACY: pages the relay serves share its origin, so a script on a proxied
+// page can fetch /__relay_ip as well - see the README. Set IP_WIDGET to false
+// to remove the endpoint and both widgets.
+const IP_WIDGET = true;
+const IP_PATH = '/__relay_ip';
+const IP_ECHO_URLS = ['https://api64.ipify.org', 'https://icanhazip.com', 'https://checkip.amazonaws.com'];
+const IP_LOOKUP_MS = 2500;
+const IP_BUDGET_MS = 5000;
+const IP_CACHE_MS = 60000;
+let relayEgressCache = { at: 0, value: null };
+let relayEgressInflight = null;
+
+function cleanIp(text) {
+  const t = String(text || '').trim();
+  if (!t || t.length > 45) return null;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(t)) return t;
+  if (t.includes(':') && /^[0-9a-fA-F:.]+$/.test(t)) return t;
+  return null;
+}
+
+async function lookupEgressIp() {
+  const now = Date.now();
+  if (relayEgressCache.value && now - relayEgressCache.at < IP_CACHE_MS) return relayEgressCache.value;
+  if (relayEgressInflight) return relayEgressInflight;
+  relayEgressInflight = (async () => {
+    const deadline = Date.now() + IP_BUDGET_MS;
+    for (const u of IP_ECHO_URLS) {
+      const left = deadline - Date.now();
+      if (left < 300) break;
+      try {
+        const res = await fetchWithTimeout(u, { headers: { 'Accept': 'text/plain', 'Cache-Control': 'no-cache' } }, Math.min(IP_LOOKUP_MS, left));
+        if (!res.ok) continue;
+        const ip = cleanIp(await res.text());
+        if (ip) {
+          const value = { ip, source: new URL(u).hostname };
+          relayEgressCache = { at: Date.now(), value };
+          return value;
+        }
+      } catch {
+        // try the next echo service
+      }
+    }
+    return null;
+  })();
+  try {
+    return await relayEgressInflight;
+  } finally {
+    relayEgressInflight = null;
+  }
+}
+
+async function ipInfoResponse(request) {
+  const cf = request.cf || {};
+  const ip = request.headers.get('CF-Connecting-IP') ||
+    (request.headers.get('X-Forwarded-For') || '').split(',')[0].trim() || null;
+  const relay = await lookupEgressIp();
+  const body = {
+    you: { ip, country: cf.country || null, city: cf.city || null, region: cf.region || null, asn: cf.asn || null, org: cf.asOrganization || null },
+    relay: relay ? { ip: relay.ip, source: relay.source } : null,
+    colo: cf.colo || null
+  };
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }
+  });
+}
+
 // Derived-host aliasing. Some sites build server names from location.hostname
 // - Proton turns account.proton.me into account-api.proton.me - and under the
 // relay location.hostname is the RELAY'S host, so the page asks for names like
@@ -603,7 +681,7 @@ self.addEventListener('fetch', (event) => {
 
   // The relay's own pages: the server decides whether one is the relay's or a
   // proxied site's escaped link of the same name.
-  if (url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/cookies') return;
+  if (url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/cookies' || url.pathname === '/__relay_ip' || url.pathname === '/__relay_debug') return;
 
   // Already correctly path-embedded, or the SW script/root usage page — leave alone.
   if (/^\\/https?:\\/\\//.test(url.pathname)) return;
@@ -736,6 +814,21 @@ const HOME_HTML = `<!doctype html>
   .header-btn:hover { border-color: var(--text-dim); }
   button.header-btn { cursor: pointer; }
   .header-form { margin: 0; }
+  .ipbox {
+    margin: 28px 0 0;
+    max-width: 52ch;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+  }
+  .ip-row { display: flex; gap: 12px; padding: 4px 0; }
+  .ip-label { flex: 0 0 78px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; font-size: 11px; }
+  .ip-val { word-break: break-all; }
+  .ip-foot { display: flex; justify-content: space-between; margin-top: 6px; color: var(--text-dim); font-size: 11px; }
+  .ip-foot a { color: var(--text-dim); }
   .note {
     margin: 28px 0 0;
     max-width: 52ch;
@@ -913,6 +1006,7 @@ const HOME_HTML = `<!doctype html>
         <div class="line"><span class="pulse" style="animation-delay: 1.6s;"></span></div>
         <div class="node"><span class="sq"></span><span class="label">target</span></div>
       </div>
+      __RELAY_IPBOX__
       __RELAY_NOTICE__
     </main>
 
@@ -982,6 +1076,38 @@ const HOME_HTML = `<!doctype html>
     e.preventDefault();
     go();
   });
+
+  // IP widget: your IP as Cloudflare sees it, and the IP sites see for the relay.
+  var ipBox = document.getElementById('ipbox');
+  if (ipBox) {
+    var ipYou = document.getElementById('ipYou');
+    var ipRelay = document.getElementById('ipRelay');
+    var ipVia = document.getElementById('ipVia');
+    var ipLoad = function() {
+      ipYou.textContent = 'checking…';
+      ipRelay.textContent = 'checking…';
+      ipVia.textContent = '';
+      fetch('/__relay_ip', { cache: 'no-store', credentials: 'same-origin' }).then(function(r) {
+        return r.json();
+      }).then(function(d) {
+        var y = d.you || {};
+        var bits = [y.ip || 'unknown'];
+        if (y.country) bits.push(y.country);
+        if (y.asn) bits.push('AS' + y.asn + (y.org ? ' ' + y.org : ''));
+        ipYou.textContent = bits.join(' · ');
+        ipRelay.textContent = d.relay ? d.relay.ip : 'unavailable';
+        ipVia.textContent = d.colo ? 'via Cloudflare ' + d.colo : '';
+      }).catch(function() {
+        ipYou.textContent = 'unavailable';
+        ipRelay.textContent = 'unavailable';
+      });
+    };
+    document.getElementById('ipRefresh').addEventListener('click', function(e) {
+      e.preventDefault();
+      ipLoad();
+    });
+    ipLoad();
+  }
 
   input.addEventListener('input', function() {
     hint.textContent = 'Prefix is optional — https:// is assumed.';
@@ -1588,6 +1714,12 @@ export default {
       );
     }
 
+    // IP widget data (see IP_WIDGET). Placed before the escape-recovery logic so
+    // a proxied page's own /__relay_ip link, if it had one, is not "repaired".
+    if (IP_WIDGET && url.pathname === IP_PATH && (request.method === 'GET' || request.method === 'HEAD')) {
+      return ipInfoResponse(request);
+    }
+
     // Cookie manager: lists the sites that have cookies in this browser's jar
     // and clears them. Like /login, a proxied site's own /cookies link that
     // escaped to this origin is repaired from the Referer instead.
@@ -1722,13 +1854,19 @@ export default {
       const notice = hasPassword
         ? ''
         : '<p class="note">Password protection is off, so anyone with this address can use this relay, and there is no relay login to log out of. Set the <code>PASSWORD</code> secret to turn on a login — the <b>Log out</b> button appears here once it is set.</p>';
+      const ipBox = IP_WIDGET
+        ? '<div class="ipbox" id="ipbox"><div class="ip-row"><span class="ip-label">you</span><span class="ip-val" id="ipYou">checking…</span></div>' +
+          '<div class="ip-row"><span class="ip-label">sites see</span><span class="ip-val" id="ipRelay">checking…</span></div>' +
+          '<div class="ip-foot"><span id="ipVia"></span><a href="#" id="ipRefresh">refresh</a></div></div>'
+        : '';
       const homeHtml = HOME_HTML
         .replace('__RELAY_LOGOUT_LINK__', footerLinks.map((l) => ' · ' + l).join(''))
         .replace('__RELAY_HEADER_ACTIONS__', headerButtons.join(''))
+        .replace('__RELAY_IPBOX__', ipBox)
         .replace('__RELAY_NOTICE__', notice);
       return new Response(homeHtml, {
         status: 200,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, no-store' }
       });
     }
 
@@ -3092,6 +3230,8 @@ class ScriptInjector {
           'padding:6px 8px;background:#1a1a1a;border-bottom:1px solid #333;position:sticky;top:0;">' +
           '<span style="color:#ccc;">relay v0.11.0 \u2014 failed requests</span>' +
           '<span style="display:flex;gap:10px;align-items:center;">' +
+          '<button id="__relay_debug_ip" title="Show your IP and the IP sites see" style="background:none;border:1px solid #444;' +
+          'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:2px 6px;">IP</button>' +
           '<button id="__relay_debug_link" title="Copy a relay link to this page" style="background:none;border:1px solid #444;' +
           'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:2px 6px;">Link</button>' +
           '<button id="__relay_debug_copy" style="background:none;border:1px solid #444;' +
@@ -3119,6 +3259,11 @@ class ScriptInjector {
         document.getElementById('__relay_debug_close').addEventListener('click', function() {
           panel.style.display = 'none';
         });
+        document.getElementById('__relay_debug_ip').addEventListener('click', function(e) {
+          // Only a real click by the person: a page script calling .click() is ignored.
+          if (e.isTrusted === false) return;
+          relayLoadIps();
+        });
         document.getElementById('__relay_debug_link').addEventListener('click', function() {
           var lbtn = document.getElementById('__relay_debug_link');
           function ldone(ok) { lbtn.textContent = ok ? 'Copied!' : 'Copy failed'; setTimeout(function() { lbtn.textContent = 'Link'; }, 1500); }
@@ -3143,11 +3288,41 @@ class ScriptInjector {
         });
       }
 
+      // The IP check runs only when the person presses IP, and is never stored
+      // (not in the log history, not in Copy).
+      var relayIpInfo = null;
+      function relayLoadIps() {
+        relayIpInfo = { loading: true };
+        relayRenderList();
+        var f = typeof origFetch === 'function' ? origFetch : window.fetch;
+        f.call(window, proxyOrigin + '/__relay_ip', { cache: 'no-store', credentials: 'same-origin' }).then(function(r) {
+          return r.json();
+        }).then(function(d) {
+          relayIpInfo = d || { error: true };
+          relayRenderList();
+        }, function() {
+          relayIpInfo = { error: true };
+          relayRenderList();
+        });
+      }
+      function relayIpRows() {
+        var d = relayIpInfo;
+        if (!d) return '';
+        var st = 'padding:6px 8px;border-bottom:1px solid #262626;color:#9ee;word-break:break-all;';
+        if (d.loading) return '<div style="' + st + '">checking IPs...</div>';
+        if (d.error || !d.you) return '<div style="' + st + '">IP check unavailable</div>';
+        var bits = [d.you.ip || 'unknown'];
+        if (d.you.country) bits.push(d.you.country);
+        if (d.you.asn) bits.push('AS' + d.you.asn);
+        return '<div style="' + st + '">you: ' + relayEsc(bits.join(' \u00b7 ')) + '</div>' +
+          '<div style="' + st + '">sites see: ' + relayEsc(d.relay ? d.relay.ip : 'unavailable') +
+          (d.colo ? ' \u00b7 via ' + relayEsc(d.colo) : '') + '</div>';
+      }
       function relayRenderList() {
         try {
           var list = document.getElementById('__relay_debug_list');
           if (!list) return;
-          list.innerHTML = '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#8fb4ff;' +
+          list.innerHTML = relayIpRows() + '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#8fb4ff;' +
             'word-break:break-all;">page: ' + relayEsc(relayCurrentRealUrl()) + '</div>' + relayRows().map(function(r) {
             return '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#eee;' +
               'word-break:break-all;">' + (r.t ? '<span style="color:#789;">' + relayEsc(r.t) + '</span> ' : '') +
@@ -3906,4 +4081,4 @@ class ScriptInjector {
     </script>
   `;
   }
-}
+    }
