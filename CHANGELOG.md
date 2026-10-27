@@ -42,17 +42,71 @@
 - WebSocket handshakes carry the target's cookies.
 - `/cookies`: a cookie manager that lists the sites with cookies in this
   browser — cookie **names** only, never values, with the HttpOnly ones marked —
-  and clears one site or all of them. Linked from the homepage footer.
-- Homepage: a visible **Log out** button in the header, next to the theme
-  toggle, in addition to the footer link. Both appear only when `PASSWORD` is
-  set (there is no session to end otherwise).
-- In debug mode, navigations that are form submissions are labelled `form
-  submit` in the log.
+  and clears one site or all of them.
+- Homepage controls: a **Cookies** button (the manager) and a **Sign out of
+  sites** button (one press clears every site's cookies in this browser) in the
+  header, a **Log out** button next to them when `PASSWORD` is set, and the same
+  links in the footer. With no password set the homepage says so: the relay is
+  open to anyone with the address and there is no relay login to log out of.
+- IP widget (`IP_WIDGET`, on by default). The homepage shows two lines under the
+  address bar — **you**, the visitor's real IP as Cloudflare sees it
+  (`CF-Connecting-IP`) with the country and network it derived, and **sites
+  see**, the relay's outbound IP — plus the Cloudflare data center serving the
+  request, with a refresh link. The diagnostic panel has an **IP** button that
+  shows the same two lines. `/__relay_ip` returns them as JSON, `Cache-Control:
+  no-store`. "Sites see" is found by asking an IP-echo service from inside the
+  Worker (`api64.ipify.org`, then `icanhazip.com`, then `checkip.amazonaws.com`;
+  2.5 s each, 5 s overall, concurrent requests share one lookup, cached for a
+  minute), so it is what an outside site sees right now — Cloudflare may use
+  several outbound addresses, so it can vary — and the echo services only ever
+  see the Worker's own address. A failed lookup shows "unavailable" and the
+  visitor's own IP still appears. The homepage HTML never contains an IP (the
+  widget fetches it after load), the panel fetches only when pressed, ignores
+  clicks made by a page's script, escapes everything it renders, and never
+  stores the result (not in the log history, not in Copy). With a password set the
+  endpoint is behind the login. Set `IP_WIDGET` to `false` to remove the
+  endpoint and both widgets. Privacy note: every proxied page shares the relay's
+  origin, so a script written to attack the relay can fetch `/__relay_ip` too,
+  and the relay does not hide the visitor's IP from WebRTC.
+- Derived-host aliasing (`DERIVED_HOST_ALIASES`, on by default). Sites that
+  build server names from `location.hostname` — Proton turns
+  `account.proton.me` into `account-api.proton.me` — ask the relay for names
+  such as `relay-api.<your domain>`, which do not exist and ended in a 502.
+  When the page's real site is known (from the `Referer`), the Worker applies
+  the same derivation to the real host: `<relay label>-<suffix>.<relay rest>`
+  becomes `<page label>-<suffix>.<page rest>` and `<prefix>.<relay host>`
+  becomes `<prefix>.<page host>`, so `relay-api.whitedragon.us.ci` requested
+  from `account.proton.me` is fetched from `account-api.proton.me`; cookies and
+  cache entries use the translated host. With no page context nothing is
+  translated, and when a name under the relay's own domain still cannot be
+  reached the error page says why.
+- Captcha widgets. A captcha checks which site is hosting it, and the page's
+  script fills that in from `location`, which under the relay is the relay's
+  address, so the provider rejects the sitekey. For URLs of the well-known
+  providers (hCaptcha, reCAPTCHA, Cloudflare Turnstile, Arkose/FunCaptcha,
+  GeeTest, Friendly Captcha, DataDome, captcha-delivery) the injected script
+  swaps the relay's name for the embedding page's real one in `host=`,
+  `hostname=`, `domain=`, `parent=` and `origin=` (query or fragment) and
+  re-encodes reCAPTCHA's `co=`. Failed requests to a captcha provider are
+  labelled in the diagnostic panel. This removes the mechanical reasons a
+  captcha cannot work through the relay; whether a provider accepts a solve is
+  its own decision (many also judge the network a request comes from, and
+  Turnstile sends the site name in a message rather than a URL).
+- `MessageEvent.origin` reports the origin a frame really has. Every page and
+  frame the relay serves lives on the relay's origin, so origin checks on
+  incoming messages ("is this really hcaptcha.com?") in widgets, captchas,
+  payment and sign-in frames always failed. A message from a frame of a
+  different real site now reports that site's origin; from a frame of the
+  page's own site it keeps the relay origin, which is what `location.origin`
+  says; names derived from the relay's host are mapped back to the derived form
+  the page expects.
 - Optional speed switch `BLOCKED_HOSTS` (off by default): hostnames matching it
   are answered with an empty 204 instead of being fetched, which removes
   analytics and ad requests — each a full Worker round trip — from every page.
   Blocking can break pages that expect those scripts, which is why it is off;
   the comment above the constant carries a starter list.
+- In debug mode, navigations that are form submissions are labelled `form
+  submit` in the log.
 
 ### Changed
 - Speed. The injected script is built and minified once per isolate instead of
@@ -88,8 +142,9 @@
   `Referer` is a proxied page is treated as that site's escaped link and
   repaired like any other; typed or bookmarked visits, the relay's own login
   form (posted from `/login`) and the login redirect (`?redirect=`) are the
-  relay's. The relay's Service Worker leaves `/login`, `/logout` and `/cookies`
-  alone and lets the server decide.
+  relay's. The relay's Service Worker leaves `/login`, `/logout`, `/cookies`,
+  `/__relay_ip` and `/__relay_debug` alone and lets the server decide.
+- The homepage is sent `Cache-Control: private, no-store`.
 - Caching with the jar on: requests that carry jar cookies bypass every cache
   (Cloudflare's fetch cache and the relay's edge cache); `cacheEverything`
   applies only to static assets (`script`/`style`/`image`/`font`), because a
@@ -109,6 +164,9 @@
 - Cookies set on a redirect hop were lost, because the Worker followed
   redirects itself with a throwaway cookie view (see Added).
 - A POST that escaped to the relay origin was turned into a GET (see Changed).
+- Proton's human-verification step ended in a 502 for
+  `relay-api.<your domain>`, a name the page derived from the relay's own
+  hostname (see Added: derived-host aliasing).
 
 ## v0.10.0
 
