@@ -96,6 +96,20 @@ and, when a password is set, **Log out** (ends the relay session). The same
 links are in the footer. With no password set the homepage says the relay is
 open to anyone with the address and that there is no relay login to log out of.
 
+**IP widget:** under the address bar the homepage shows **you** — your real IP
+as Cloudflare sees it, with country and network — and **sites see** — the IP the
+relay fetches from, which is what the sites you visit see instead of yours —
+plus the Cloudflare data center serving you, with a **refresh** link. In the
+diagnostic panel the **IP** button shows the same two lines (it fetches only
+when you press it, and the result is never stored or copied). "Sites see" is
+measured from inside the Worker with an IP-echo service
+(`api64.ipify.org`, `icanhazip.com`, `checkip.amazonaws.com`) and cached for a
+minute; Cloudflare may use several outbound addresses, so it can vary from one
+check to the next, and a failed lookup shows "unavailable". Your own IP is
+never sent to the echo services — they only see the Worker's address. See the
+privacy notes under *Limitations*, and set `IP_WIDGET` to `false` to remove the
+widget and its `/__relay_ip` endpoint.
+
 **Logging in:** sites you sign into stay signed in — see *Cookie jar* below.
 Use a throwaway account to try it: your password passes through your Worker and
 Cloudflare on its way to the site, and nothing here is safe for an account you
@@ -107,11 +121,13 @@ the checklist.
 **Diagnostic panel:** on any proxied page, failures (non-2xx fetch/XHR,
 WebSocket errors, resources that failed to load) collapse into a small
 top-right button, `relay · N`. It never opens by itself: click to expand.
-Inside, the first line (`page: …`) shows the current page's real URL, **Link**
-copies a working relay link for it, and **Copy** puts the failure list on the
-clipboard without DevTools. A failed request to a captcha provider is labelled
-as such. Cloudflare's own `/cdn-cgi/` requests and preload failures are
-filtered out so they don't inflate N.
+Inside, the first line (`page: …`) shows the current page's real URL, **IP**
+shows your IP and the one sites see, **Link** copies a working relay link for
+the page, and **Copy** puts the failure list on the clipboard without DevTools.
+A failed request to a captcha provider is labelled as such. Cloudflare's own
+`/cdn-cgi/` requests and preload failures are filtered out so they don't inflate
+N. The panel exists on a page after its first failure, on real-path hosts, and
+from page load when debug mode is on.
 
 **Debug mode:** visit `https://relay.<username>.workers.dev/__relay_debug` to
 turn on verbose diagnostics for 24 hours (a cookie; `/__relay_debug?on=0` turns
@@ -183,7 +199,8 @@ CSS `url()`) works inside files the relay never parses.
   string (a consent manager's `href=<relay>/https://…`, or `href=<relay>/news`
   on a real-path page) are restored to the real URL. The browser's own cookies
   are never forwarded as-is: the target gets only the cookies from the jar
-  below.
+  below. The visitor's IP is never forwarded (`CF-Connecting-IP`,
+  `X-Forwarded-For` and friends are dropped).
 - Timeout, one retry for bodyless requests, `Retry-After`-aware backoff on
   429/503, and a styled error page for Cloudflare edge failures.
 - Caching: edge cache for static assets (GET only), keyed partly on the
@@ -203,6 +220,13 @@ CSS `url()`) works inside files the relay never parses.
 - The relay answers `/favicon.ico` and `/robots.txt` at its own root, so
   those bare-origin requests never enter the target-recovery path. A target's
   own `/cdn-cgi/rum` and `/cdn-cgi/speculation` get a 204.
+- **IP widget endpoint.** `/__relay_ip` (GET/HEAD, behind the password gate,
+  before the escape-recovery logic) returns `{ you: { ip, country, city, region,
+  asn, org }, relay: { ip, source } | null, colo }` with `Cache-Control:
+  no-store`. `you` comes from `CF-Connecting-IP` and Cloudflare's request
+  metadata; `relay` from an IP-echo lookup run in the Worker (three services in
+  turn, 2.5 s each and 5 s overall, one shared lookup for concurrent requests,
+  cached for a minute). Switch: `IP_WIDGET`.
 - Narrow search-engine special case: embedded URLs in
   `links.duckduckgo.com` responses are rewritten server-side
   (`SEARCH_DATA_HOSTS`; add other engines only after inspecting their
@@ -376,7 +400,10 @@ Inside the injected script, read link attributes with
 proxied" check never matches and causes an infinite rewrite loop. Likewise,
 read the page's real cookie string with `relayRawCookie()` /
 `relayRawCookieSet()`: `document.cookie` is the jar shim, which hides the
-relay's own cookies.
+relay's own cookies. To call the relay itself from the injected script (the
+panel's IP button does), use the native fetch (`origFetch`) with an absolute
+relay URL: the patched `fetch` would rewrite a relay path into the proxied
+site's.
 
 The jar's cookie-name scheme, record format and base64url codec exist twice —
 the Worker's `jarCookieName`/`loadJar`/`storeSetCookies` and the injected
@@ -447,6 +474,13 @@ different cookies all survive.
     `relay-api.<your domain>`; in the panel (or debug log) the request went to
     the page's real API host. A captcha widget may still refuse — that is the
     provider's decision, not the relay's.
+15. IP widget: the homepage shows your IP under **you** and a different IP
+    under **sites see** (compare with what an IP-check site such as
+    `httpbin.org/ip` reports when opened through the relay — that one is what a
+    site really sees, and should match **sites see** or be another address from
+    the same Cloudflare range); **refresh** re-checks; in a proxied page's panel
+    the **IP** button shows the same two lines and the lines disappear from
+    **Copy**.
 
 ### Login test sites
 
@@ -496,6 +530,19 @@ change.
   datacenter IPs will refuse or loop. Your credentials pass through your Worker
   and Cloudflare, and providers sometimes lock or alert on a login that arrives
   through a proxy: use throwaway accounts.
+- **Your IP: what is and is not hidden.** The relay never forwards your IP in
+  headers, so sites you fetch through it see the relay's outbound address, not
+  yours — but Cloudflare, and whoever runs the Worker, see it. It is not hidden
+  from WebRTC (a page can discover your address through a peer connection, which
+  the relay does not intercept), and the IP widget adds one more way to read it:
+  every proxied page shares the relay's origin, so a script written to attack the
+  relay could fetch `/__relay_ip`. The panel button is guarded (it fetches only
+  on a real click, never stores the result, and keeps it out of Copy) and the
+  homepage HTML never embeds an IP, but that is mitigation, not isolation; real
+  isolation needs each site on its own origin (see the roadmap in the project
+  notes). "Sites see" is a spot check from an outside echo service: Cloudflare
+  may use several outbound addresses, sites on Cloudflare itself see further
+  Cloudflare-specific signals, and the lookup can fail ("unavailable").
 - **Cookie jar limits.** Cookies are stored in the visitor's browser on the
   relay's origin, so every proxied site shares that origin: a page's script can
   read the *script-visible* (non-HttpOnly) cookies of other proxied sites by
