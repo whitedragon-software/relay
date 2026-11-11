@@ -39,7 +39,7 @@
 //   client-side WebSocket override below) — browser <-> Worker <-> real
 //   target, including converting the handshake's Origin header to the real
 //   target's own origin, since many WS servers reject a mismatched one.
-// - Every regex inside the ScriptInjector template below is DOUBLE-escaped
+// - Every regex inside the injected-script template below is DOUBLE-escaped
 //   (\\/ etc.): the template literal consumes one level of backslashes, so
 //   single-escaped regexes arrive at the browser corrupted (\\/ck\\/a$ //
 //   collapsing to a line comment, killing the whole injected script).
@@ -80,8 +80,52 @@
 //   attribute now open in the requested target; and the idle stale-link
 //   sweep runs only in debug mode — it was pure diagnostics, costing
 //   main-thread time on every page load.
+//
+// UNRELEASED changes (on top of v0.13; version number not bumped yet):
+// Stability
+// - Upstream response headers that would act on the RELAY'S origin are now
+//   stripped from every passthrough: Strict-Transport-Security (could pin
+//   the relay's whole parent domain), Clear-Site-Data (could wipe the relay's
+//   cookie jar and storage), Content-Security-Policy / X-Frame-Options (break
+//   workers and framed documents), Link (raw preload URLs bypass the relay),
+//   Report-To / NEL / Alt-Svc / Expect-CT / Public-Key-Pins.
+// - upstream.url is captured BEFORE any header re-wrap. Re-wrapping a
+//   Response (which every site sending Referrer-Policy triggered) used to
+//   blank .url, silently losing the final-URL <base> and redirect handling
+//   whenever the cookie jar was off.
+// - Null-body statuses (204 / 205 / 304) that carry a text/html type are no
+//   longer pushed through HTMLRewriter (a Response constructor TypeError ->
+//   relay 500 page instead of the real 304).
+// - Range requests no longer hit the edge cache (a cached full 200 could be
+//   returned for a Range request, breaking media seeking and big downloads),
+//   and a throwing cache.match is treated as a miss.
+// - Upstream retry only for GET/HEAD (a bodyless POST could be sent twice);
+//   a timed-out target is not retried and reports a readable timeout.
+// - WebSocket bridge: invalid close codes (1005/1006/...) made close() throw
+//   and left the other half-open forever; they are now mapped to valid ones.
+//   Self-reference check also compares host, not just origin.
+// - <meta http-equiv="Content-Security-Policy"> is removed: once everything is
+//   served from the relay's origin, a site's meta CSP blocks its own scripts.
+// - More client-identifying / loop headers are not forwarded upstream
+//   (True-Client-IP, X-Real-IP, Forwarded, Via, CDN-Loop, cf-geo headers).
+// Speed
+// - The injected client script is no longer inlined in every HTML page. It is
+//   served once from /__relay_inject.js?v=<hash> with a one-year immutable
+//   cache (the page only carries a tiny config script + a <script src>), and
+//   it also survives sites with a meta CSP that forbids inline scripts.
+// Gaming sites (Poki, PlayHop and similar; see GAME_MODE below)
+// - Ad / analytics hosts are refused (403, so the SDK's own ad-blocker path
+//   runs) when the page or the target is a game portal.
+// - Game assets (.wasm, .data, .unityweb, .pck, audio, 3D formats...) are
+//   edge-cached and long-cached in the browser even though they are fetched
+//   with fetch()/XHR; .wasm is served as application/wasm so
+//   WebAssembly.instantiateStreaming works.
+// - Client: Worker / SharedWorker URLs and navigator.sendBeacon go through the
+//   relay, document.referrer shows the real referring URL, and the red
+//   "relay" debug button no longer covers the game (debug mode still shows it).
 
 const SW_PATH = '/__proxy_sw.js';
+const INJECT_PATH = '/__relay_inject.js';
 
 // "Real path" mode (EXPERIMENTAL). Sites whose client-side router reads
 // location.pathname (Next.js, React Router, GitHub's React apps) can't work
@@ -104,6 +148,27 @@ const DEBUG_PATH = '/__relay_debug';
 //   /(^|\.)(google-analytics\.com|googletagmanager\.com|doubleclick\.net|googlesyndication\.com|facebook\.net|hotjar\.com|scorecardresearch\.com)$/
 const BLOCKED_HOSTS = /^$/;
 const COOKIES_PATH = '/cookies';
+
+// ---- Gaming sites -------------------------------------------------------------
+// Game portals (Poki, PlayHop, ...) host each game in a cross-origin iframe, load
+// big wasm/data bundles with fetch()/XHR, talk to an ad SDK and to the portal
+// through postMessage, and spend most of their load time on ad and analytics
+// requests that rarely survive a relay. Set GAME_MODE to false to turn all of
+// this off.
+// A request is in "game context" when its target host OR the page that made it
+// (from the Referer) matches GAME_HOSTS. Add portals here.
+const GAME_MODE = true;
+const GAME_HOSTS = /(^|\.)(poki\.com|poki-gdn\.com|poki-cdn\.com|playhop\.com|games\.yandex\.(ru|com)|yandex\.net|yastatic\.net|crazygames\.com|gamedistribution\.com|gamemonetize\.com|y8\.com|itch\.io|itch\.zone|kongregate\.com|newgrounds\.com|ungrounded\.net|miniclip\.com|armorgames\.com|addictinggames\.com)$/i;
+// Ad / analytics hosts refused in game context. The answer is a 403 with an
+// empty body, which is what a browser ad-blocker looks like to an SDK (the
+// script's error event fires), so the SDK takes its "no ads" path and the game
+// starts instead of waiting on an ad request. Set GAME_BLOCK_ADS to false if a
+// game hangs because of it.
+const GAME_BLOCK_ADS = true;
+const GAME_AD_HOSTS = /(^|\.)(googlesyndication\.com|doubleclick\.net|googleadservices\.com|googletagservices\.com|googletagmanager\.com|google-analytics\.com|imasdk\.googleapis\.com|2mdn\.net|adnxs\.com|amazon-adsystem\.com|criteo\.(com|net)|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|smartadserver\.com|adsafeprotected\.com|moatads\.com|scorecardresearch\.com|hotjar\.com|connect\.facebook\.net|mc\.yandex\.(ru|com)|an\.yandex\.ru|adfox\.yandex\.ru|adfox\.ru|yandexadexchange\.net|yabs\.yandex\.ru|adfstat\.yandex\.ru)$/i;
+// File types that count as game assets: edge-cached and long-cached even when
+// fetched via fetch()/XHR (which the normal rules treat as uncacheable).
+const GAME_ASSET_PATH = /\.(wasm|unityweb|data|bundle|pck|mem|symbols|glb|gltf|ktx2|basis|atlas|skel|fnt|ogg|mp3|wav|m4a|br|gz)$/i;
 
 // ---- IP widget ----------------------------------------------------------------
 // A small widget on the homepage (and behind an "IP" button in the diagnostic
@@ -705,7 +770,7 @@ self.addEventListener('install', (event) => {
       // so routing them statically skips waking the worker at all — a
       // visible difference on phones, where each SW wake-up adds latency
       // to the homepage and to the SW's own update checks.
-      const ownPaths = ['/', '/login', '/logout', '/cookies', '/__relay_ip', '/__relay_debug', '/__proxy_sw.js'];
+      const ownPaths = ['/', '/login', '/logout', '/cookies', '/__relay_ip', '/__relay_debug', '/__proxy_sw.js', '${INJECT_PATH}'];
       for (const p of ownPaths) {
         try {
           const r2 = event.addRoutes({ condition: { urlPattern: { pathname: p } }, source: 'network' });
@@ -739,7 +804,7 @@ self.addEventListener('fetch', (event) => {
 
   // The relay's own pages: the server decides whether one is the relay's or a
   // proxied site's escaped link of the same name.
-  if (url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/cookies' || url.pathname === '/__relay_ip' || url.pathname === '/__relay_debug') return;
+  if (url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/cookies' || url.pathname === '/__relay_ip' || url.pathname === '/__relay_debug' || url.pathname === '${INJECT_PATH}') return;
 
   // Already correctly path-embedded, or the SW script/root usage page — leave alone.
   if (/^\\/https?:\\/\\//.test(url.pathname)) return;
@@ -1685,9 +1750,23 @@ function authPage(redirectTo, wrongPassword) {
 </html>`;
 }
 
+// WebSocket close codes: a Worker-side close() only accepts 1000 or 3000-4999
+// (a peer reporting 1005/1006/1011... made close() throw, which left the OTHER
+// half of the bridge open forever). Map anything else to a valid code, and keep
+// the reason short (the protocol caps it at 123 bytes).
+function wsSafeClose(sock, code, reason) {
+  let c = Number(code);
+  if (!(c === 1000 || (c >= 3000 && c <= 4999))) c = (!c || c === 1001 || c === 1005) ? 1000 : 4011;
+  try {
+    sock.close(c, String(reason || '').slice(0, 40));
+  } catch {
+    try { sock.close(1000, ''); } catch {}
+  }
+}
+
 // WebSocket bridging: browser <-> this Worker <-> the real target.
-// The client-side WebSocket constructor override (in ScriptInjector) routes
-// ws(s) connections through this same path-embedded scheme (e.g.
+// The client-side WebSocket constructor override (in the injected script)
+// routes ws(s) connections through this same path-embedded scheme (e.g.
 // /wss://real.com/socket); this is the server-side half that completes the
 // handshake on both ends and relays messages/close/error between them.
 //
@@ -1706,7 +1785,7 @@ async function handleWebSocketUpgrade(request, url, proxyOrigin) {
   } catch {
     return new Response('Invalid WebSocket target', { status: 400 });
   }
-  if (parsedTarget.origin.replace(/^wss?/, 'https') === proxyOrigin) {
+  if (parsedTarget.origin.replace(/^wss?/, 'https') === proxyOrigin || parsedTarget.host === url.host) {
     return new Response('Refusing to proxy the relay itself', { status: 400 });
   }
 
@@ -1773,14 +1852,10 @@ async function handleWebSocketUpgrade(request, url, proxyOrigin) {
   upstreamSocket.addEventListener('message', (e) => {
     try { server.send(e.data); } catch {}
   });
-  server.addEventListener('close', (e) => {
-    try { upstreamSocket.close(e.code, e.reason); } catch {}
-  });
-  upstreamSocket.addEventListener('close', (e) => {
-    try { server.close(e.code, e.reason); } catch {}
-  });
-  server.addEventListener('error', () => { try { upstreamSocket.close(); } catch {} });
-  upstreamSocket.addEventListener('error', () => { try { server.close(); } catch {} });
+  server.addEventListener('close', (e) => wsSafeClose(upstreamSocket, e.code, e.reason));
+  upstreamSocket.addEventListener('close', (e) => wsSafeClose(server, e.code, e.reason));
+  server.addEventListener('error', () => wsSafeClose(upstreamSocket, 1000, ''));
+  upstreamSocket.addEventListener('error', () => wsSafeClose(server, 4011, 'upstream error'));
 
   // Echo back whichever subprotocol the REAL server actually accepted —
   // not simply the client's request verbatim.
@@ -1890,6 +1965,25 @@ async function handleRelayRequest(request, env, ctx) {
       return new Response(SW_SCRIPT, {
         headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache', 'ETag': etag }
       });
+    }
+
+    // The injected client script (see ScriptInjector). Served from memory, with
+    // the content hash in the URL, so the browser keeps it for a year and every
+    // later page load costs nothing. Placed before the escape-recovery logic so
+    // a proxied page's request for it is never "repaired" into a target fetch.
+    if (url.pathname === INJECT_PATH && (request.method === 'GET' || request.method === 'HEAD')) {
+      const inj = await getInjected(proxyOrigin, COOKIE_JAR);
+      const etag = '"' + inj.ver + '"';
+      const injHeaders = {
+        'Content-Type': 'application/javascript; charset=utf-8',
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'ETag': etag,
+        'X-Content-Type-Options': 'nosniff'
+      };
+      if ((request.headers.get('If-None-Match') || '').includes(etag)) {
+        return new Response(null, { status: 304, headers: injHeaders });
+      }
+      return new Response(request.method === 'HEAD' ? null : inj.text, { status: 200, headers: injHeaders });
     }
 
     // Debug mode switch: visit /__relay_debug to turn the injected script's
@@ -2072,8 +2166,9 @@ async function handleRelayRequest(request, env, ctx) {
       return errorResponse(proxyOrigin, 400, 'Unsupported protocol', 'This relay only forwards http:// and https:// addresses.', null, parsedTarget.href);
     }
     // Refuse a self-referential target — otherwise the Worker would fetch
-    // its own origin, recursively, on a crafted or accidental link.
-    if (parsedTarget.origin === proxyOrigin) {
+    // its own origin, recursively, on a crafted or accidental link. Compared by
+    // host as well as origin, so http://<relay> cannot slip past the check.
+    if (parsedTarget.origin === proxyOrigin || parsedTarget.host === url.host) {
       return errorResponse(proxyOrigin, 400, 'Refusing to proxy itself', "This address points back at the relay's own origin, which would cause it to fetch itself.", null, parsedTarget.href);
     }
 
@@ -2109,6 +2204,26 @@ async function handleRelayRequest(request, env, ctx) {
 
     if (BLOCKED_HOSTS.test(parsedTarget.hostname)) return new Response(null, { status: 204 });
 
+    // Game context (see GAME_MODE): the target itself, or the page that made
+    // the request, is a game portal / game host.
+    let gameCtx = false;
+    if (GAME_MODE) {
+      gameCtx = GAME_HOSTS.test(parsedTarget.hostname);
+      if (!gameCtx && pageCtx.origin) {
+        try {
+          gameCtx = GAME_HOSTS.test(new URL(pageCtx.origin).hostname);
+        } catch {
+          // unknown page: not a game context
+        }
+      }
+    }
+    // Ad / analytics requests from a game: refuse like an ad-blocker would, so
+    // the SDK's own "no ads" path runs instead of the game waiting on them.
+    if (gameCtx && GAME_BLOCK_ADS && GAME_AD_HOSTS.test(parsedTarget.hostname)) {
+      return new Response(null, { status: 403, headers: { 'Cache-Control': 'no-store', 'X-Relay-Blocked': '1' } });
+    }
+    const gameAsset = gameCtx && GAME_ASSET_PATH.test(parsedTarget.pathname);
+
     // Edge cache: identical proxied requests skip origin + rewriting entirely.
     // GET-only — the Cache API throws on non-GET requests.
     // Cookie jar (see COOKIE_JAR): this visitor's cookies for the target, as an
@@ -2136,7 +2251,13 @@ async function handleRelayRequest(request, env, ctx) {
       cookieHeader = jarCookieHeader(jar, parsedTarget, crossSite, jarCtx.topNav);
     }
 
-    const cacheable = request.method === 'GET' && !cookieHeader;
+    // Range requests and HLS/DASH manifests must not go through the blanket
+    // edge cache: a cached live playlist is stale within seconds (live video
+    // stalls), and a cached FULL body must never answer a Range request (the
+    // cache key ignores Range, so seeking and resumed downloads broke).
+    const noEdgeCache = request.headers.has('Range') || /\.(m3u8|mpd)$/i.test(parsedTarget.pathname);
+
+    const cacheable = request.method === 'GET' && !cookieHeader && !noEdgeCache;
     const cache = caches.default;
     // The cache key embeds a token derived from the request's Accept header:
     // the real browser's Accept is forwarded upstream, so the same URL can
@@ -2152,18 +2273,20 @@ async function handleRelayRequest(request, env, ctx) {
       : null;
     // With the jar on, HTML is never stored, so a document or an API call can
     // never hit the cache - skip the lookup (a network round trip) for them.
+    // Game assets are the exception: they are fetched with fetch()/XHR
+    // (destination "empty") yet are static, and worth a lookup.
     const fetchDest = request.headers.get('Sec-Fetch-Dest') || '';
     const cacheLookup = cacheable &&
-      !(jarOn && /^(document|iframe|frame|empty|embed|object|worker|sharedworker|serviceworker|manifest|report|xslt|fencedframe)$/.test(fetchDest));
+      (gameAsset || !(jarOn && /^(document|iframe|frame|empty|embed|object|worker|sharedworker|serviceworker|manifest|report|xslt|fencedframe)$/.test(fetchDest)));
     if (cacheLookup) {
-      const cached = await cache.match(cacheKey);
+      let cached = null;
+      try {
+        cached = await cache.match(cacheKey);
+      } catch {
+        cached = null;   // a throwing cache is a miss, never a failed request
+      }
       if (cached) return cached;
     }
-
-    // Range requests and HLS/DASH manifests must not go through the blanket
-    // edge cache: a cached live playlist is stale within seconds (live video
-    // stalls), and caching a partial-content request is wrong.
-    const noEdgeCache = request.headers.has('Range') || /\.(m3u8|mpd)$/i.test(parsedTarget.pathname);
 
     const upstreamInit = {
       method: request.method,
@@ -2173,15 +2296,16 @@ async function handleRelayRequest(request, env, ctx) {
       // for any request that carries jar cookies and — once the cookie jar is
       // on, since a first visit can set a cookie that a cached copy would
       // never replay to the next visitor — for everything except static
-      // assets (script/style/image/font). With the jar off it applies as
-      // before. It caches at Cloudflare's fetch layer (not just our own edge
-      // cache below), which cuts a real origin round-trip on repeat hits.
+      // assets (script/style/image/font, and game assets fetched via
+      // fetch()/XHR). With the jar off it applies as before. It caches at
+      // Cloudflare's fetch layer (not just our own edge cache below), which
+      // cuts a real origin round-trip on repeat hits.
       // cacheTtlByStatus, not cacheTtl: with cacheEverything, cacheTtl
       // applies to error statuses too, so a single transient 500/404 was
       // replayed from Cloudflare's cache to every visitor for the full
       // TTL. 1s on the error ranges is effectively "don't cache" without
       // relying on 0-TTL handling.
-      cf: (noEdgeCache || cookieHeader || (jarOn && !/^(script|style|image|font)$/.test(fetchDest)))
+      cf: (noEdgeCache || cookieHeader || (jarOn && !gameAsset && !/^(script|style|image|font)$/.test(fetchDest)))
         ? undefined
         : { cacheEverything: true, cacheTtlByStatus: { '200-299': 300, '400-499': 1, '500-599': 1 } }
     };
@@ -2215,6 +2339,12 @@ async function handleRelayRequest(request, env, ctx) {
       return errorResponse(proxyOrigin, 502, "Couldn't reach that address", 'The request to the target failed before any response came back.', (derivedHostHint(parsedTarget.hostname, proxyOrigin) + ' ' + error.message).trim(), parsedTarget.href);
     }
 
+    // The FINAL url after any redirects fetch() followed. Captured BEFORE any
+    // header re-wrap below: a re-wrapped Response (new Response(body, init))
+    // has an empty .url, which silently lost the final-URL handling for every
+    // site that sends one of the headers we strip.
+    const upstreamFinalUrl = upstream.url || '';
+
     // Cloudflare's own edge — not the target site — returns these statuses
     // for connectivity failures (DNS didn't resolve, origin unreachable,
     // etc). fetch() doesn't throw for these; it resolves as a normal-looking
@@ -2225,16 +2355,15 @@ async function handleRelayRequest(request, env, ctx) {
       return errorResponse(proxyOrigin, 502, "Couldn't reach that address", "The target domain didn't respond — it may not exist, or is temporarily unreachable.", derivedHostHint(parsedTarget.hostname, proxyOrigin) || 'Double-check the address for typos.', parsedTarget.href);
     }
 
-    // A Referrer-Policy header on a sub-resource (a CSS file, especially)
-    // strips the Referer from the requests THAT resource itself issues —
-    // exactly what the server-side escape recovery depends on. Everything
-    // the relay serves is same-origin with the relay, so the browser's
-    // default policy (full URL for same-origin requests) is both safe and
-    // the most recoverable. The HTML path rebuilds its headers from scratch
-    // anyway; this covers every passthrough path below. Re-wraps only when
-    // the header is present, so the zero-copy passthrough is untouched
-    // otherwise.
-    upstream = stripResponseHeader(upstream, 'Referrer-Policy');
+    // Headers that would act on the RELAY'S origin (HSTS, Clear-Site-Data, CSP,
+    // X-Frame-Options, Link preloads, ...) or strip the Referer from this
+    // file's own subrequests (Referrer-Policy) are dropped from every
+    // passthrough. The HTML path rebuilds its headers from scratch anyway; this
+    // covers every path below. Re-wraps only when one is present, so the
+    // zero-copy passthrough is untouched otherwise.
+    upstream = stripResponseHeaders(upstream, UNSAFE_RESPONSE_HEADERS);
+    // WebAssembly.instantiateStreaming needs application/wasm exactly.
+    upstream = fixWasmType(upstream, parsedTarget.pathname);
 
     // Cookie changes from this response, ready to hand to the browser.
     const jarSetCookies = jarOn ? jarSetCookieHeaders(jar) : [];
@@ -2273,19 +2402,24 @@ async function handleRelayRequest(request, env, ctx) {
     }
 
     const contentType = upstream.headers.get('content-type') || '';
+    // Statuses that must not carry a body. A 304 can still advertise
+    // text/html; feeding it to HTMLRewriter and wrapping the result in a new
+    // Response throws a TypeError (null-body status with a body), which used
+    // to surface as the relay's 500 page instead of the real 304.
+    const nullBodyStatus = upstream.status === 101 || upstream.status === 204 || upstream.status === 205 || upstream.status === 304;
     // XHTML is rewritable too — previously application/xhtml+xml streamed
     // through untouched (raw links, no injected script). Served as
     // text/html below, which real-world XHTML renders under fine; the one
     // known hazard is XHTML's legal self-closing external <script/>,
     // which HTML parsing treats as an unclosed <script> tag.
-    const isHtml =
-      contentType.includes('text/html') || contentType.includes('application/xhtml+xml');
+    const isHtml = !nullBodyStatus &&
+      (contentType.includes('text/html') || contentType.includes('application/xhtml+xml'));
 
     // Non-HTML: stream through untouched, but for static asset types (JS,
-    // CSS, fonts, images) that browsers otherwise under-cache, extend
-    // Cache-Control client-side AND store at the edge — a chunk fetched by
-    // one visitor is then served instantly to the next, skipping the origin
-    // and the Worker's rewriting path entirely.
+    // CSS, fonts, images, wasm, game bundles) that browsers otherwise
+    // under-cache, extend Cache-Control client-side AND store at the edge — a
+    // chunk fetched by one visitor is then served instantly to the next,
+    // skipping the origin and the Worker's rewriting path entirely.
     if (!isHtml) {
       // Search engines increasingly deliver actual result data via a
       // separate payload fetched by client-side JS (confirmed for
@@ -2299,9 +2433,9 @@ async function handleRelayRequest(request, env, ctx) {
       // general "rewrite URLs in any response" rule, which would risk
       // corrupting arbitrary application code that uses URL-like strings
       // for its own internal logic.
-      if (SEARCH_DATA_HOSTS.has(parsedTarget.hostname)) {
+      if (SEARCH_DATA_HOSTS.has(parsedTarget.hostname) && !nullBodyStatus) {
         const text = await upstream.text();
-        const rewritten = rewriteEmbeddedUrls(text, upstream.url || parsedTarget.href, proxyOrigin);
+        const rewritten = rewriteEmbeddedUrls(text, upstreamFinalUrl || parsedTarget.href, proxyOrigin);
         const dataHeaders = new Headers(upstream.headers);
         withJarCookies(dataHeaders, jarSetCookies);
         // .text() already returned the DECODED body — stale length and
@@ -2317,7 +2451,7 @@ async function handleRelayRequest(request, env, ctx) {
         });
       }
 
-      if (upstream.status === 200 && isLongCacheable(contentType)) {
+      if (upstream.status === 200 && (isLongCacheable(contentType) || gameAsset)) {
         const headers = new Headers(upstream.headers);
         // Extend client-side caching ONLY when upstream didn't express its
         // own freshness policy: an explicit no-store / no-cache / private /
@@ -2358,9 +2492,9 @@ async function handleRelayRequest(request, env, ctx) {
     // Otherwise page JS that reads location.pathname and feeds it back into
     // history/URL APIs produces mismatched paths. Top-level/iframe
     // navigations only; subresource fetches follow redirects natively.
-    if (request.method === 'GET' && request.headers.get('Sec-Fetch-Mode') === 'navigate' && upstream.url) {
+    if (request.method === 'GET' && request.headers.get('Sec-Fetch-Mode') === 'navigate' && upstreamFinalUrl) {
       try {
-        const finalUrl = new URL(upstream.url);
+        const finalUrl = new URL(upstreamFinalUrl);
         const requestedUrl = new URL(upstreamHref);
         finalUrl.hash = '';
         requestedUrl.hash = '';
@@ -2374,12 +2508,11 @@ async function handleRelayRequest(request, env, ctx) {
       }
     }
 
-    // upstream.url is the FINAL URL after any redirects fetch() followed
-    // server-side — using the pre-redirect parsedTarget.href here would
-    // resolve every relative link/script/etc against the wrong page
-    // whenever the target redirects (auth flows, trailing-slash/canonical
-    // redirects, moved domains).
-    const baseUrl = upstream.url || parsedTarget.href;
+    // The final URL after any redirects fetch() followed server-side — using
+    // the pre-redirect parsedTarget.href here would resolve every relative
+    // link/script/etc against the wrong page whenever the target redirects
+    // (auth flows, trailing-slash/canonical redirects, moved domains).
+    const baseUrl = upstreamFinalUrl || parsedTarget.href;
     const proxiedBase = proxyOrigin + '/' + baseUrl;
 
     // Real-path mode: hand the injected script the real path to show.
@@ -2390,6 +2523,10 @@ async function handleRelayRequest(request, env, ctx) {
     } catch {
       // leave empty
     }
+
+    // The injected client script lives at INJECT_PATH (cached for a year); the
+    // page only gets a tiny config script plus a <script src> carrying the hash.
+    const injected = await getInjected(proxyOrigin, COOKIE_JAR);
 
     const rewriter = new HTMLRewriter()
       .on('meta[name]', new MetaReferrerRewriter())
@@ -2412,8 +2549,9 @@ async function handleRelayRequest(request, env, ctx) {
       .on('img[srcset]', new SrcsetRewriter(baseUrl, proxyOrigin))
       .on('source[srcset]', new SrcsetRewriter(baseUrl, proxyOrigin))
       .on('meta[http-equiv]', new MetaRefreshRewriter(baseUrl, proxyOrigin))
+      .on('meta[http-equiv]', new MetaCspRemover())
       .on('head', new BaseTagInjector(proxiedBase))
-      .on('head', new ScriptInjector(proxyOrigin, spoofPath, COOKIE_JAR));
+      .on('head', new ScriptInjector(proxyOrigin, spoofPath, gameCtx, injected.ver));
 
     const transformed = rewriter.transform(upstream);
 
@@ -2478,13 +2616,20 @@ function stripProxyFromQuery(parsed, proxyOrigin, pageOrigin) {
 // Everything else the page/browser actually sent is forwarded as-is — an
 // allowlist here would always be one custom header behind real-world sites
 // (anti-abuse tokens, API versioning headers, CSRF tokens, etc); a denylist
-// is far more robust. Cookies specifically are never forwarded (see README
-// limitations).
+// is far more robust. Cookies specifically are never forwarded raw (the
+// cookie jar builds the Cookie header itself).
+// The extra entries are client-identifying or loop-control headers that a
+// proxy in front of the Worker may add: none of them mean anything upstream
+// and several (True-Client-IP, X-Real-IP, the cf-geo set) would tell the target
+// who the visitor is.
 const DROP_HEADERS = new Set([
   'host', 'cookie', 'content-length', 'connection',
   'user-agent',
   'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-worker',
   'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host',
+  'true-client-ip', 'x-real-ip', 'forwarded', 'via', 'cdn-loop',
+  'cf-connecting-ipv6', 'cf-pseudo-ipv4', 'cf-ipcity', 'cf-ipcontinent', 'cf-iplatitude', 'cf-iplongitude',
+  'cf-region', 'cf-region-code', 'cf-postal-code', 'cf-timezone', 'cf-metro-code', 'cf-ew-via',
   'referer', 'origin' // handled specially below, not silently forwarded raw
 ]);
 
@@ -2575,12 +2720,21 @@ function parseRetryAfterMs(header) {
 // indefinitely — bounded so a single slow connection can't quietly eat the
 // Worker's whole execution budget. Only wraps the request itself; once a
 // WebSocket handshake completes, the resulting socket lives independently
-// of this signal and is unaffected by it.
+// of this signal and is unaffected by it. A timeout is reported as a readable
+// error flagged relayTimeout, so callers can tell it from a connection blip.
 async function fetchWithTimeout(url, init, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs || 20000);
+  const ms = timeoutMs || 20000;
+  const timer = setTimeout(() => controller.abort(), ms);
   try {
     return await fetch(url, Object.assign({}, init, { signal: controller.signal }));
+  } catch (err) {
+    if (controller.signal.aborted) {
+      const e = new Error('The target did not answer within ' + Math.round(ms / 1000) + ' seconds.');
+      e.relayTimeout = true;
+      throw e;
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -2588,8 +2742,9 @@ async function fetchWithTimeout(url, init, timeoutMs) {
 
 // One retry on transient network failure (DNS blip, connection reset) —
 // not on HTTP error statuses, which are legitimate responses returned as-is
-// either way. Only retried when there's no body: a ReadableStream can only
-// be read once, so a request that already carries one gets a single try.
+// either way. Only for GET/HEAD without a body: a ReadableStream can only be
+// read once, and re-sending a POST (even a bodyless one) could act twice. A
+// timed-out target is not retried either — a second 20 s wait rarely helps.
 //
 // Also adds a short, capped retry specifically for throttling responses
 // (429/503) that include a short Retry-After — relevant for game traffic
@@ -2599,15 +2754,17 @@ async function fetchWithTimeout(url, init, timeoutMs) {
 // browsing. Capped at 2s and one attempt so a single request can never
 // stall for long chasing a throttle that isn't going to clear soon.
 async function fetchUpstream(url, init, timeoutMs) {
+  const method = String(init.method || 'GET').toUpperCase();
+  const retryable = !init.body && (method === 'GET' || method === 'HEAD');
   let response;
   try {
     response = await fetchWithTimeout(url, init, timeoutMs);
   } catch (err) {
-    if (init.body) throw err;
+    if (!retryable || err.relayTimeout) throw err;
     response = await fetchWithTimeout(url, init, timeoutMs);
   }
 
-  if ((response.status === 429 || response.status === 503) && !init.body) {
+  if ((response.status === 429 || response.status === 503) && retryable) {
     const waitMs = parseRetryAfterMs(response.headers.get('Retry-After'));
     if (waitMs !== null && waitMs <= 2000) {
       await sleep(waitMs);
@@ -2625,20 +2782,63 @@ async function fetchUpstream(url, init, timeoutMs) {
 // Content-types safe to cache aggressively client-side: static, commonly
 // content-hashed, and re-requested often by proxied SPAs. Deliberately
 // excludes video/audio (range-request/seeking behavior) and anything
-// JSON/API-shaped (freshness matters).
-const STATIC_CACHE_TYPES = ['text/css', 'javascript', 'image/', 'font/'];
+// JSON/API-shaped (freshness matters). wasm is static by nature.
+const STATIC_CACHE_TYPES = ['text/css', 'javascript', 'image/', 'font/', 'application/wasm'];
 function isLongCacheable(contentType) {
   return STATIC_CACHE_TYPES.some((t) => contentType.includes(t));
 }
 
-// Removes one header from a passthrough response. Only re-wraps — a cheap
-// header copy; the body stream passes through untouched — when the header is
-// actually present, so the zero-copy passthrough stays zero-copy.
-function stripResponseHeader(response, name) {
-  if (!response.headers.has(name)) return response;
+// Response headers that must never reach the browser through the relay,
+// because every proxied site shares the relay's ORIGIN:
+//  - Strict-Transport-Security: a target's includeSubDomains/preload would pin
+//    the relay's whole parent domain.
+//  - Clear-Site-Data: would wipe the relay's own cookie jar and storage.
+//  - Content-Security-Policy(-Report-Only), X-Frame-Options: written for the
+//    target's origin; on a script/worker/document served from the relay they
+//    only break it.
+//  - Link: carries raw preload/preconnect URLs that bypass the relay.
+//  - Report-To, Reporting-Endpoints, NEL, Alt-Svc, Expect-CT, Public-Key-Pins:
+//    reporting/transport hints about the target's host, meaningless here.
+//  - Referrer-Policy: strips the Referer from this file's own subrequests,
+//    which the server-side escape recovery depends on.
+const UNSAFE_RESPONSE_HEADERS = [
+  'referrer-policy', 'strict-transport-security', 'clear-site-data',
+  'content-security-policy', 'content-security-policy-report-only', 'x-frame-options',
+  'link', 'report-to', 'reporting-endpoints', 'nel', 'alt-svc',
+  'expect-ct', 'public-key-pins', 'public-key-pins-report-only'
+];
+
+// Removes headers from a passthrough response. Only re-wraps — a cheap
+// header copy; the body stream passes through untouched — when one of them is
+// actually present, so the zero-copy passthrough stays zero-copy. NOTE: a
+// re-wrapped Response has an empty .url; callers capture upstream.url first.
+function stripResponseHeaders(response, names) {
+  let present = false;
+  for (const n of names) {
+    if (response.headers.has(n)) { present = true; break; }
+  }
+  if (!present) return response;
   try {
     const headers = new Headers(response.headers);
-    headers.delete(name);
+    for (const n of names) headers.delete(n);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers
+    });
+  } catch {
+    return response;
+  }
+}
+
+// WebAssembly.instantiateStreaming requires the exact type application/wasm;
+// plenty of game CDNs serve .wasm as octet-stream or text/plain.
+function fixWasmType(response, pathname) {
+  if (response.status !== 200 || !/\.wasm$/i.test(pathname)) return response;
+  if (/application\/wasm/i.test(response.headers.get('Content-Type') || '')) return response;
+  try {
+    const headers = new Headers(response.headers);
+    headers.set('Content-Type', 'application/wasm');
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -2912,6 +3112,21 @@ class MetaReferrerRewriter {
   }
 }
 
+// A <meta http-equiv="Content-Security-Policy"> is the in-markup twin of the
+// CSP header the relay already drops from every response. Left in, it is
+// evaluated against the RELAY'S origin: its script-src/connect-src/img-src
+// host lists (written for the real site) block the proxied copies of the same
+// scripts, images and XHRs. Registered last among the meta[http-equiv]
+// handlers so the other two have already looked at the element.
+class MetaCspRemover {
+  element(el) {
+    const httpEquiv = (el.getAttribute('http-equiv') || '').toLowerCase();
+    if (httpEquiv === 'content-security-policy' || httpEquiv === 'content-security-policy-report-only') {
+      el.remove();
+    }
+  }
+}
+
 // Makes directory-relative references from JS-created/dynamic content (never
 // seen by HTMLRewriter, since it only runs on the initial HTML response)
 // resolve against the *proxied* current page instead of escaping to the
@@ -2929,50 +3144,70 @@ class BaseTagInjector {
   }
 }
 
-// The injected script is the same for every page of a deployment, so it is
-// built and minified once per isolate and only the real path (a placeholder
-// token) is substituted per request. Minifying strips full-line comments and
-// indentation - about 45% of the source - which the browser would otherwise
-// download and parse on every page. It never touches a line that does not
-// start with `//`, and the script contains no multi-line string or block
-// comment, so it cannot change what the code does.
-const SPOOF_TOKEN = '"__RELAY_SPOOF_PATH__"';
+// The injected client script is the same for every page of a deployment, so it
+// is built and minified once per isolate and served as a static, immutable file
+// (INJECT_PATH, versioned by content hash) instead of being inlined into every
+// HTML page. Minifying strips full-line comments and indentation - about 45% of
+// the source. It never touches a line that does not start with `//`, and the
+// script contains no multi-line string or block comment, so it cannot change
+// what the code does.
 const INJECT_CACHE = new Map();
 
 function minifyInjected(code) {
   return code.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('//')).join('\n');
 }
 
+async function getInjected(proxyOrigin, cookieJar) {
+  const key = proxyOrigin + '|' + (cookieJar ? 1 : 0);
+  let hit = INJECT_CACHE.get(key);
+  if (hit) return hit;
+  const text = minifyInjected(buildInjectedScript(proxyOrigin, cookieJar));
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  const ver = Array.from(new Uint8Array(digest)).slice(0, 8).map((b) => b.toString(16).padStart(2, '0')).join('');
+  hit = { text, ver };
+  if (INJECT_CACHE.size >= 8) INJECT_CACHE.clear();
+  INJECT_CACHE.set(key, hit);
+  return hit;
+}
+
+// Per-page settings travel in a tiny inline config script (real path for
+// real-path mode, and the game-context flag); everything else is the shared,
+// cacheable file. If an inline script is ever blocked the file falls back to
+// normal mode, so a failure here costs a feature, never the page.
 class ScriptInjector {
-  constructor(proxyOrigin, realPath, cookieJar) {
+  constructor(proxyOrigin, realPath, gameMode, ver) {
     this.proxyOrigin = proxyOrigin;
     this.realPath = realPath || '';
-    this.cookieJar = !!cookieJar;
+    this.gameMode = !!gameMode;
+    this.ver = ver;
   }
   element(el) {
-    const key = this.proxyOrigin + '|' + this.cookieJar;
-    let script = INJECT_CACHE.get(key);
-    if (!script) {
-      script = minifyInjected(this.scriptText());
-      if (INJECT_CACHE.size >= 8) INJECT_CACHE.clear();
-      INJECT_CACHE.set(key, script);
-    }
-    const pathLiteral = JSON.stringify(this.realPath).replace(/</g, '\\u003c');
-    el.prepend(script.replace(SPOOF_TOKEN, () => pathLiteral), { html: true });
+    const cfg = 'window.__relayCfg={p:' + JSON.stringify(this.realPath).replace(/</g, '\\u003c') +
+      ',g:' + (this.gameMode ? 1 : 0) + '};';
+    const src = this.proxyOrigin + INJECT_PATH + '?v=' + this.ver;
+    el.prepend('<script>' + cfg + '</script><script src="' + escapeHtml(src) + '"></script>', { html: true });
   }
-  scriptText() {
-    return `
-    <script>
+}
+// The client script itself. Returns plain JavaScript (no <script> tags): it is
+// served as a file from INJECT_PATH. It is a template literal, so every
+// backslash in a regex or string below is written twice (\\/ etc.).
+function buildInjectedScript(proxyOrigin, cookieJar) {
+  return `
     (function() {
-      var proxyOrigin = '${this.proxyOrigin}';
+      var proxyOrigin = '${proxyOrigin}';
+      // Per-page settings from the small inline config script the server puts in
+      // front of this file (see ScriptInjector). Missing = normal mode.
       // Real-path mode (see REAL_PATH_HOSTS on the server). Empty = normal mode.
-      var relaySpoofPath = "__RELAY_SPOOF_PATH__";
+      var relaySpoofPath = String((self.__relayCfg && self.__relayCfg.p) || "");
       var relaySpoofReal = '';
+      // Game context (see GAME_MODE on the server): keeps the relay's debug
+      // button from covering a game unless debug mode is on.
+      var relayGame = !!(self.__relayCfg && self.__relayCfg.g);
       // Cookie jar (see COOKIE_JAR on the server): document.cookie is replaced
       // by a shim over the jar cookies. Everything in this script that needs
       // the page's REAL cookie string (the relay's own debug and context
       // cookies) goes through these two native accessors.
-      var relayJarOn = ${this.cookieJar ? 'true' : 'false'};
+      var relayJarOn = ${cookieJar ? 'true' : 'false'};
       var relayCookieDesc = null;
       try { relayCookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie'); } catch (e) {}
       function relayRawCookie() {
@@ -3596,7 +3831,10 @@ class ScriptInjector {
           // never a site defect, only log noise.
           if (typeof realUrl === 'string' && realUrl.indexOf('/cdn-cgi/') !== -1) return;
           if (!note && typeof realUrl === 'string' && relayIsCaptchaUrl(realUrl)) note = 'captcha provider: may not complete through the relay';
-          relayEnsurePanel();
+          // In a game context the button would sit on top of the game's own UI
+          // (and refused ad requests would raise it on every load), so it is not
+          // created unless debug mode is on. Failures are still recorded.
+          if (!(relayGame && !RELAY_DEBUG)) relayEnsurePanel();
           __relayFailures.unshift({ method: method, url: realUrl, status: status, note: note || '' });
           if (__relayFailures.length > MAX_LOGGED) __relayFailures.pop();
           if (RELAY_DEBUG) {
@@ -3897,6 +4135,73 @@ class ScriptInjector {
           PatchedWebSocket.CLOSING = OrigWebSocket.CLOSING;
           PatchedWebSocket.CLOSED = OrigWebSocket.CLOSED;
           window.WebSocket = PatchedWebSocket;
+        }
+      } catch (e) {}
+
+      // Web Workers: games and big apps (Emscripten/Unity/Godot threads, audio
+      // and physics engines) start workers with a URL the page wrote for the
+      // REAL site. An absolute URL would bypass the relay and be refused as
+      // cross-origin; a root-relative one escapes to the relay's origin. Route
+      // the URL through the same resolution as everything else. blob:/data:
+      // URLs pass through toProxied untouched.
+      try {
+        if (typeof window.Worker === 'function') {
+          var OrigWorker = window.Worker;
+          var PatchedWorker = function(url, opts) {
+            var wu = url;
+            try {
+              if (typeof url === 'string' || (url && typeof url.href === 'string')) wu = toProxied(String(url));
+            } catch (e) {}
+            return opts !== undefined ? new OrigWorker(wu, opts) : new OrigWorker(wu);
+          };
+          PatchedWorker.prototype = OrigWorker.prototype;
+          window.Worker = PatchedWorker;
+        }
+      } catch (e) {}
+      try {
+        if (typeof window.SharedWorker === 'function') {
+          var OrigSharedWorker = window.SharedWorker;
+          var PatchedSharedWorker = function(url, opts) {
+            var su = url;
+            try {
+              if (typeof url === 'string' || (url && typeof url.href === 'string')) su = toProxied(String(url));
+            } catch (e) {}
+            return opts !== undefined ? new OrigSharedWorker(su, opts) : new OrigSharedWorker(su);
+          };
+          PatchedSharedWorker.prototype = OrigSharedWorker.prototype;
+          window.SharedWorker = PatchedSharedWorker;
+        }
+      } catch (e) {}
+
+      // navigator.sendBeacon is another network API the fetch/XHR patches never
+      // see: left alone, every analytics/ad beacon goes straight from the
+      // visitor's browser to a third party, around the relay (showing the real
+      // IP and, for game SDKs, never reaching the relay's ad-host filter).
+      try {
+        if (navigator && typeof navigator.sendBeacon === 'function') {
+          var origBeacon = navigator.sendBeacon;
+          navigator.sendBeacon = function(url, data) {
+            var bu = url;
+            try { bu = toProxied(String(url)); } catch (e) {}
+            return origBeacon.call(navigator, bu, data);
+          };
+        }
+      } catch (e) {}
+
+      // document.referrer inside a proxied page is "<relay>/https://real.site/..."
+      // (or the relay's own address), which breaks the site/portal checks that
+      // game SDKs and embeds run on it. Show the real referring URL instead.
+      try {
+        var relayRefDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'referrer');
+        if (relayRefDesc && relayRefDesc.get) {
+          Object.defineProperty(Document.prototype, 'referrer', {
+            get: function() {
+              var rr = relayRefDesc.get.call(this);
+              try { return fromProxied(rr); } catch (e) { return rr; }
+            },
+            configurable: true,
+            enumerable: relayRefDesc.enumerable
+          });
         }
       } catch (e) {}
 
@@ -4376,7 +4681,5 @@ class ScriptInjector {
         };
       } catch (e) {}
     })();
-    </script>
   `;
-  }
 }
