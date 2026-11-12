@@ -137,7 +137,7 @@ const INJECT_PATH = '/__relay_inject.js';
 // short-lived cookie so a reload of the bare path can be routed back.
 // Trade-off: the address bar no longer contains the embedded target. Add or
 // remove hosts here; set to /^$/ to disable the mode entirely.
-const REAL_PATH_HOSTS = /^(www\.)?(bbc\.com|bbc\.co\.uk|github\.com|react\.dev)$/i;
+const REAL_PATH_HOSTS = /^(www\.)?(bbc\.com|bbc\.co\.uk|github\.com|react\.dev|poki\.com|playhop\.com|crazygames\.com)$/i;
 const CTX_COOKIE = '__relay_ctx';
 const DEBUG_PATH = '/__relay_debug';
 // OPTIONAL speed switch, OFF by default: hostnames matching this are answered
@@ -163,8 +163,13 @@ const GAME_HOSTS = /(^|\.)(poki\.com|poki-gdn\.com|poki-cdn\.com|playhop\.com|ga
 // empty body, which is what a browser ad-blocker looks like to an SDK (the
 // script's error event fires), so the SDK takes its "no ads" path and the game
 // starts instead of waiting on an ad request. Set GAME_BLOCK_ADS to false if a
-// game hangs because of it.
-const GAME_BLOCK_ADS = true;
+// game hangs because of it. OFF by default: blocking is a guess about how each
+// game's SDK reacts, and it is not worth risking a game that would otherwise load.
+// Game PORTALS built as client-side apps (poki.com, playhop.com, crazygames.com)
+// are in REAL_PATH_HOSTS above, because their routers read location.pathname.
+// Only the portal belongs there, never the game's own host (poki-gdn.com...):
+// real-path mode keeps ONE real origin in a cookie shared by every frame.
+const GAME_BLOCK_ADS = false;
 const GAME_AD_HOSTS = /(^|\.)(googlesyndication\.com|doubleclick\.net|googleadservices\.com|googletagservices\.com|googletagmanager\.com|google-analytics\.com|imasdk\.googleapis\.com|2mdn\.net|adnxs\.com|amazon-adsystem\.com|criteo\.(com|net)|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|smartadserver\.com|adsafeprotected\.com|moatads\.com|scorecardresearch\.com|hotjar\.com|connect\.facebook\.net|mc\.yandex\.(ru|com)|an\.yandex\.ru|adfox\.yandex\.ru|adfox\.ru|yandexadexchange\.net|yabs\.yandex\.ru|adfstat\.yandex\.ru)$/i;
 // File types that count as game assets: edge-cached and long-cached even when
 // fetched via fetch()/XHR (which the normal rules treat as uncacheable).
