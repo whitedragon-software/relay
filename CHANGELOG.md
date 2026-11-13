@@ -1,5 +1,214 @@
 # Changelog
 
+## v0.13.0
+
+### Added
+- Settings page at `/settings`, reached from a **Settings** button in the
+  homepage header. It now holds everything that used to sit in the homepage
+  header, plus the browsing mode:
+  - **Appearance**: Light and Dark buttons (stored in `localStorage`, as the
+    homepage theme was);
+  - **Browsing mode**: see the next entry;
+  - **Debug bar**: turns debug mode on or off from the page (the same
+    24-hour `__relay_debug` cookie that `/__relay_debug` sets, which still
+    works) and shows its current state;
+  - **Your IP**: a **Check my IP** button; nothing is requested until it is
+    pressed, nothing is stored, and `IP_WIDGET = false` removes the section;
+  - **Cookie jar**: the sites that have cookies in this browser with a
+    **Clear** button each, **Clear all cookies**, and a link to `/cookies`
+    (the names-only list);
+  - **Session**: **Log out**, present only when `PASSWORD` is set.
+  The homepage header is reduced to the single Settings button; the IP box,
+  the Cookies and Sign out of sites buttons, the Log out button, the theme
+  toggle and the footer links are gone from it. With a password set the page
+  sits behind the login like everything else.
+- Per-site browsing mode. Every site now opens in **original** mode (the
+  target embedded in the path, `relay/https://site`). A site that needs
+  **real-path** mode is switched in Settings, either by typing the site in the
+  field or with one tap on a suggestion (`poki.com`, `playhop.com`,
+  `crazygames.com`, `github.com`, `bbc.com`, `bbc.co.uk`, `react.dev`,
+  `SUGGESTED_REAL_PATH`), and the choice is remembered per site. The Worker
+  still has no storage: the list lives in one `__relay_rp` cookie on the
+  relay's origin (`HttpOnly; Secure; SameSite=Lax`, one year, bare hosts
+  without `www.`, separated by `|`, at most 40 sites). A host matches exactly,
+  with or without `www.`: `poki.com` does not cover `poki-gdn.com`, which is
+  deliberate — real-path mode keeps one real origin in a cookie shared by every
+  frame, so only the portal belongs in the list, never a game's own host.
+  Switching a site in either direction also expires the `__relay_ctx` cookie,
+  so a stale real-path context cannot keep re-routing bare paths. Clearing all
+  browser cookies forgets the list; **Clear all cookies** in Settings and
+  **Sign out of sites** only touch the cookie jar and leave it alone.
+- **Mode** button in the debug panel: opens `/settings?site=<host>` for the
+  site being viewed, with a card showing its current mode and a one-tap
+  switch. This is the way to switch a site that renders blank (Poki): turn the
+  debug bar on once, tap `relay`, then **Mode**, then reload the site.
+  `/settings` follows the same rule as `/login` and `/cookies`: a request
+  without a proxied-page `Referer`, or carrying `?site=` or `?note=`, is the
+  relay's own; a proxied site's own `/settings` link that escaped to the
+  relay's origin is still repaired from the `Referer`. The Service Worker
+  leaves it alone and routes it straight to the network.
+- Gaming-site handling (`GAME_MODE`, on by default). Game portals (Poki,
+  PlayHop, CrazyGames, GameDistribution, GameMonetize, Y8, itch.io, Kongregate,
+  Newgrounds, Miniclip, Armor Games, Addicting Games and the Yandex games
+  hosts, `GAME_HOSTS`) host each game in a cross-origin iframe, load large
+  wasm/data bundles with `fetch()`/XHR and talk to ad SDKs, none of which the
+  generic rules were tuned for. A request is in "game context" when its target
+  host or the page that made it (from the `Referer`) is in `GAME_HOSTS`. In
+  game context:
+  - game assets (`.wasm`, `.unityweb`, `.data`, `.bundle`, `.pck`, `.mem`,
+    `.glb`, `.gltf`, `.ktx2`, `.basis`, audio and similar, `GAME_ASSET_PATH`)
+    are cached at Cloudflare's fetch layer and in the relay's edge cache even
+    though they are fetched with destination `empty`, which the jar-on rules
+    exclude, and get the 24 h browser cache when upstream gives no freshness
+    policy;
+  - the debug button no longer appears over the game after the first failed or
+    refused request (debug mode still shows it);
+  - optional ad and analytics refusal (`GAME_BLOCK_ADS`, **off** by default):
+    hosts in `GAME_AD_HOSTS` get an empty `403`, which is what a browser
+    ad-blocker looks like to an SDK (the script's error event fires), so the
+    SDK takes its "no ads" path. It is off because how each game reacts is
+    not predictable; turn it on per deployment if ad requests stall a game.
+- `.wasm` responses are served as `application/wasm` when upstream sends
+  another type, so `WebAssembly.instantiateStreaming` works, and
+  `application/wasm` joins the long-cacheable types.
+- Client patches: `Worker` and `SharedWorker` URLs go through the relay (an
+  absolute URL bypassed it and was refused as cross-origin, a root-relative
+  one escaped to the relay's origin; `blob:` and `data:` pass through
+  untouched); `navigator.sendBeacon` goes through the relay (beacons used to
+  go straight from the browser to third parties, around the relay and showing
+  the real IP); `document.referrer` shows the real referring URL instead of
+  `<relay>/https://real.site/…`, which game SDKs and embeds check.
+- Page markup: a `<meta http-equiv="Content-Security-Policy">` (and the
+  report-only variant) is removed. It is the in-markup twin of the CSP header
+  the relay already drops, and once everything is served from the relay's
+  origin its host lists block the proxied copies of the site's own scripts,
+  images and requests.
+
+### Changed
+- Real-path mode is no longer a hard-coded list. `REAL_PATH_HOSTS` is gone and
+  no site uses real-path mode until it is switched in Settings. **Upgrade
+  note:** `bbc.com`, `bbc.co.uk`, `github.com` and `react.dev` previously
+  switched automatically; they now open in original mode until switched
+  (they are one-tap suggestions), and the same applies to `poki.com`, which
+  renders nothing in original mode.
+- Speed. The injected client script (about 39 KB minified) is no longer
+  inlined in every HTML page. It is served from `/__relay_inject.js?v=<hash>`
+  with `Cache-Control: public, max-age=31536000, immutable` and an `ETag`,
+  built and minified once per isolate, with the SHA-256 prefix of the text as
+  the version, so a redeploy that changes the script changes the URL. The page
+  carries only a small config script (`window.__relayCfg`: the real path for
+  real-path mode and the game-context flag) and a `<script src>`. If the
+  config script is ever blocked the file falls back to normal mode, so the
+  failure costs a feature, never the page. A side effect: the script also loads
+  on pages whose CSP forbids inline scripts, since a same-origin file passes
+  `script-src 'self'`. The route is answered before the escape-recovery logic
+  and is in the Service Worker's own-path list; it sits behind the password
+  gate like everything else.
+- Upstream response headers that would act on the relay's own origin are now
+  stripped from every passthrough (`UNSAFE_RESPONSE_HEADERS`):
+  `Strict-Transport-Security`, `Clear-Site-Data`, `Content-Security-Policy`
+  and its report-only variant, `X-Frame-Options`, `Link`, `Report-To`,
+  `Reporting-Endpoints`, `NEL`, `Alt-Svc`, `Expect-CT`, `Public-Key-Pins` and
+  the report-only variant, and `Referrer-Policy` as before. Every proxied site
+  shares the relay's origin, so these did harm there: a target's
+  `includeSubDomains` HSTS could pin the relay's whole parent domain,
+  `Clear-Site-Data` could wipe the relay's cookie jar and storage, a CSP
+  written for the real site broke workers and framed documents served from the
+  relay, and `Link: rel=preload` carried raw URLs that bypassed it. The
+  response is re-wrapped only when one of them is present.
+- Edge cache and Range: `noEdgeCache` (Range requests, `.m3u8`, `.mpd`) is
+  decided before the cache lookup and removes the request from `cacheable`
+  altogether. The cache key ignores `Range`, so a cached full body could be
+  returned for a Range request, which broke media seeking and resumed
+  downloads. A throwing `cache.match` is now treated as a miss instead of
+  failing the request.
+- Upstream retry: the single retry after a network failure, and the capped
+  retry after a 429/503 with a short `Retry-After`, apply only to `GET` and
+  `HEAD` without a body. A bodyless `POST` used to be eligible and could act
+  twice. A timeout is reported as `The target did not answer within N
+  seconds.` and is not retried, instead of costing a second full wait.
+- WebSocket bridge: `close()` is called with a code a Worker accepts. A peer
+  closing with 1005, 1006, 1011 and similar made `close()` throw, which was
+  swallowed and left the other half of the bridge open forever; codes outside
+  1000 and 3000–4999 are mapped (1001/1005/none to 1000, the rest to 4011) and
+  the reason is cut to 40 characters (the limit is 123 bytes). An error on
+  either side now closes the other.
+- Self-reference check compares the host as well as the origin, in the Worker
+  and in the WebSocket bridge, so `http://<relay>` cannot slip past a check
+  made on the `https` origin.
+- Client-identifying and loop-control headers are not forwarded upstream:
+  `True-Client-IP`, `X-Real-IP`, `Forwarded`, `Via`, `CDN-Loop`,
+  `CF-Connecting-IPv6`, `CF-Pseudo-IPv4` and the `cf-` geo set (city,
+  continent, latitude, longitude, region, region code, postal code, timezone,
+  metro code, `cf-ew-via`).
+- The `GAME_BLOCK_ADS`, `GAME_MODE`, `GAME_HOSTS`, `GAME_AD_HOSTS` and
+  `GAME_ASSET_PATH` constants sit next to the other switches at the top of the
+  file, with comments, so a portal can be added without touching the logic.
+- Stability pass (no feature changes; carried from the start of this release):
+  - rewritten search-data payloads no longer inherit stale `Content-Encoding`
+    / `Content-Length` — `.text()` had already decoded the body, so a gzip
+    claim could make the browser fail the response;
+  - a 3xx whose `Location` the relay cannot safely wrap (custom scheme,
+    unparseable value) has the header dropped, so the browser renders the body
+    instead of silently leaving the relay;
+  - static-asset caching respects an explicit upstream `no-store`, `no-cache`,
+    `private` or real `max-age` instead of blanket-overriding it with a 24 h
+    browser cache;
+  - `Referrer-Policy` is dropped from non-HTML passthrough: on a CSS file it
+    strips the `Referer` from that file's own subrequests, which the
+    server-side escape recovery depends on;
+  - `cache.put` failures (a `Vary: *` response, an oversized entry) are
+    swallowed instead of surfacing as unhandled rejections; a malformed form
+    POST to `/login` or `/cookies` redirects back instead of throwing a
+    Cloudflare 1101; and the whole fetch handler is wrapped, so an unexpected
+    error renders the relay's own error page;
+  - `resolveAndProxy()` refuses to re-wrap an already-proxied URL, which keeps
+    the injected `<base>` safe from double-wrapping;
+  - client: `fetch(Request, init)` merges `init` like the spec (a body/method
+    conflict used to throw `TypeError`), GET forms with a `target` attribute
+    open in the requested target, and the idle stale-link sweep runs only in
+    debug mode — it was pure diagnostics and cost main-thread time on every
+    page load.
+- Version markers: the homepage footer reads `build v0.13.0 ·
+  path-embedded` and the panel header `relay v0.13.0 — failed requests`.
+
+### Fixed
+- `upstream.url` was blanked whenever a header was stripped. Re-wrapping a
+  `Response` gives it an empty `.url`, and any site sending `Referrer-Policy`
+  triggered it, so with the cookie jar off the final-URL `<base>` and the
+  redirect handling silently fell back to the pre-redirect address. The final
+  URL is now captured before any re-wrap and used from there.
+- A `304`, `204` or `205` response that advertised `text/html` was fed to
+  `HTMLRewriter` and wrapped in a new `Response` with a body, which throws a
+  `TypeError` (a null-body status cannot carry a body) and showed the relay's
+  500 page instead of the real status. These statuses now pass through as
+  non-HTML.
+- Range requests could receive a cached full `200` body (see Changed).
+- A bodyless `POST` could be sent twice by the upstream retry (see Changed).
+- A WebSocket closed with an abnormal code left its peer open forever (see
+  Changed).
+- A target's `Strict-Transport-Security` or `Clear-Site-Data` reached the
+  browser on the relay's origin (see Changed).
+- Poki rendered nothing in original mode: its client-side router reads
+  `location.pathname`. It now works once the site is switched to real-path mode
+  in Settings (see Added), and the setting is remembered.
+- Game assets fetched with `fetch()`/XHR were never cached with the jar on
+  (see Added: gaming-site handling), and wasm served with a generic type could
+  not be streamed.
+- A leftover `__relay_ctx` cookie could keep re-routing bare paths after a
+  site was taken out of real-path mode (see Added: per-site browsing mode).
+
+### Known limits
+- All proxied sites share one `localStorage` and IndexedDB, so two games using
+  the same save key can collide.
+- The real-path context cookie (`__relay_ctx`) is shared between tabs: two
+  real-path sites open at once can confuse reload and escape recovery.
+- Games and SDKs that check the real hostname (the Yandex games SDK, site
+  locks) cannot be satisfied from inside the relay, and sites that refuse
+  Cloudflare's outbound addresses cannot be reached at all.
+- `GAME_BLOCK_ADS` is a guess about each SDK's ad-blocker path; it stays off
+  until a game is known to need it.
+
 ## v0.12.0
 
 ### Added
@@ -621,4 +830,3 @@
   stay inside the relay.
 - Homepage with an address field; the real request method and body
   forwarded.
-
