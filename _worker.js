@@ -113,6 +113,18 @@
 //   served once from /__relay_inject.js?v=<hash> with a one-year immutable
 //   cache (the page only carries a tiny config script + a <script src>), and
 //   it also survives sites with a meta CSP that forbids inline scripts.
+// Settings page + per-site browsing mode
+// - New /settings page, reached from the "Settings" button on the homepage. It
+//   now holds everything that used to sit in the homepage header: light/dark
+//   theme, the debug bar, the IP check, the cookie jar, log out - and the
+//   browsing mode.
+// - Every site opens in ORIGINAL mode (the target embedded in the path) unless
+//   it was switched. Real-path mode is chosen per site in Settings and
+//   remembered in an HttpOnly cookie (__relay_rp) on the relay's origin, so the
+//   Worker still needs no storage. The old hard-coded REAL_PATH_HOSTS list is
+//   gone; its sites (poki.com, github.com, ...) are one-tap suggestions.
+// - The debug panel has a "Mode" button that opens Settings for the current
+//   site; switching modes also clears the stale real-path context cookie.
 // Gaming sites (Poki, PlayHop and similar; see GAME_MODE below)
 // - Ad / analytics hosts are refused (403, so the SDK's own ad-blocker path
 //   runs) when the page or the target is a game portal.
@@ -126,6 +138,7 @@
 
 const SW_PATH = '/__proxy_sw.js';
 const INJECT_PATH = '/__relay_inject.js';
+const SETTINGS_PATH = '/settings';
 
 // "Real path" mode (EXPERIMENTAL). Sites whose client-side router reads
 // location.pathname (Next.js, React Router, GitHub's React apps) can't work
@@ -135,9 +148,16 @@ const INJECT_PATH = '/__relay_inject.js';
 // path right after load (relative-URL resolution uses our <base> tag, not the
 // address bar, so loading is unaffected) and remembers the real origin in a
 // short-lived cookie so a reload of the bare path can be routed back.
-// Trade-off: the address bar no longer contains the embedded target. Add or
-// remove hosts here; set to /^$/ to disable the mode entirely.
-const REAL_PATH_HOSTS = /^(www\.)?(bbc\.com|bbc\.co\.uk|github\.com|react\.dev|poki\.com|playhop\.com|crazygames\.com)$/i;
+// Trade-off: the address bar no longer contains the embedded target.
+// Which sites use it is the visitor's choice, per site, made in Settings
+// (/settings -> Browsing mode) and remembered in the MODE_COOKIE cookie. Every
+// site starts in original mode.
+const MODE_COOKIE = '__relay_rp';
+const MODE_MAX_SITES = 40;
+// Sites known to need real-path mode (client-side routers that read
+// location.pathname). Offered as one-tap buttons in Settings, never applied
+// automatically.
+const SUGGESTED_REAL_PATH = ['poki.com', 'playhop.com', 'crazygames.com', 'github.com', 'bbc.com', 'bbc.co.uk', 'react.dev'];
 const CTX_COOKIE = '__relay_ctx';
 const DEBUG_PATH = '/__relay_debug';
 // OPTIONAL speed switch, OFF by default: hostnames matching this are answered
@@ -166,9 +186,10 @@ const GAME_HOSTS = /(^|\.)(poki\.com|poki-gdn\.com|poki-cdn\.com|playhop\.com|ga
 // game hangs because of it. OFF by default: blocking is a guess about how each
 // game's SDK reacts, and it is not worth risking a game that would otherwise load.
 // Game PORTALS built as client-side apps (poki.com, playhop.com, crazygames.com)
-// are in REAL_PATH_HOSTS above, because their routers read location.pathname.
-// Only the portal belongs there, never the game's own host (poki-gdn.com...):
-// real-path mode keeps ONE real origin in a cookie shared by every frame.
+// need real-path mode (Settings -> Browsing mode), because their routers read
+// location.pathname. Only the portal belongs there, never the game's own host
+// (poki-gdn.com...): real-path mode keeps ONE real origin in a cookie shared by
+// every frame.
 const GAME_BLOCK_ADS = false;
 const GAME_AD_HOSTS = /(^|\.)(googlesyndication\.com|doubleclick\.net|googleadservices\.com|googletagservices\.com|googletagmanager\.com|google-analytics\.com|imasdk\.googleapis\.com|2mdn\.net|adnxs\.com|amazon-adsystem\.com|criteo\.(com|net)|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|smartadserver\.com|adsafeprotected\.com|moatads\.com|scorecardresearch\.com|hotjar\.com|connect\.facebook\.net|mc\.yandex\.(ru|com)|an\.yandex\.ru|adfox\.yandex\.ru|adfox\.ru|yandexadexchange\.net|yabs\.yandex\.ru|adfstat\.yandex\.ru)$/i;
 // File types that count as game assets: edge-cached and long-cached even when
@@ -631,7 +652,7 @@ function recoverStatus(request) {
 // always carries ?redirect=, is the relay's. A POST is judged the same way: the
 // relay's own forms post from the relay's own pages, a proxied site's form
 // posts from a proxied page.
-const RELAY_ROUTE_PATHS = new Set(['/', '/login', '/logout', '/cookies']);
+const RELAY_ROUTE_PATHS = new Set(['/', '/login', '/logout', '/cookies', SETTINGS_PATH]);
 
 function looksLikeProxiedPageReferer(request, proxyOrigin) {
   const ref = request.headers.get('Referer');
@@ -648,6 +669,9 @@ function looksLikeProxiedPageReferer(request, proxyOrigin) {
 
 function isRelayOwnRequest(request, url, proxyOrigin) {
   if (url.searchParams.has('redirect') || url.searchParams.has('error')) return true;
+  // The debug panel's "Mode" button and the settings redirects come from a
+  // proxied page / carry a note: those are the relay's own.
+  if (url.pathname === SETTINGS_PATH && (url.searchParams.has('site') || url.searchParams.has('note'))) return true;
   return !looksLikeProxiedPageReferer(request, proxyOrigin);
 }
 function cookiesPage(jar) {
@@ -775,7 +799,7 @@ self.addEventListener('install', (event) => {
       // so routing them statically skips waking the worker at all — a
       // visible difference on phones, where each SW wake-up adds latency
       // to the homepage and to the SW's own update checks.
-      const ownPaths = ['/', '/login', '/logout', '/cookies', '/__relay_ip', '/__relay_debug', '/__proxy_sw.js', '${INJECT_PATH}'];
+      const ownPaths = ['/', '/login', '/logout', '/cookies', '/__relay_ip', '/__relay_debug', '/__proxy_sw.js', '${INJECT_PATH}', '${SETTINGS_PATH}'];
       for (const p of ownPaths) {
         try {
           const r2 = event.addRoutes({ condition: { urlPattern: { pathname: p } }, source: 'network' });
@@ -809,7 +833,7 @@ self.addEventListener('fetch', (event) => {
 
   // The relay's own pages: the server decides whether one is the relay's or a
   // proxied site's escaped link of the same name.
-  if (url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/cookies' || url.pathname === '/__relay_ip' || url.pathname === '/__relay_debug' || url.pathname === '${INJECT_PATH}') return;
+  if (url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/cookies' || url.pathname === '/__relay_ip' || url.pathname === '/__relay_debug' || url.pathname === '${INJECT_PATH}' || url.pathname === '${SETTINGS_PATH}') return;
 
   // Already correctly path-embedded, or the SW script/root usage page — leave alone.
   if (/^\\/https?:\\/\\//.test(url.pathname)) return;
@@ -1108,12 +1132,6 @@ const HOME_HTML = `<!doctype html>
       <div class="mark"><span class="dot"></span>relay</div>
       <div class="header-right">
       __RELAY_HEADER_ACTIONS__
-      <button class="theme-toggle" id="themeToggle" aria-label="Switch theme" type="button">
-        <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
-          <circle cx="12" cy="12" r="4.6"></circle>
-          <path d="M12 2.4v2.4M12 19.2v2.4M4.4 12H2M22 12h-2.4M5.6 5.6l1.7 1.7M16.7 16.7l1.7 1.7M5.6 18.4l1.7-1.7M16.7 7.3l1.7-1.7"></path>
-        </svg>
-      </button>
       </div>
     </header>
 
@@ -1141,56 +1159,17 @@ const HOME_HTML = `<!doctype html>
         <div class="line"><span class="pulse" style="animation-delay: 1.6s;"></span></div>
         <div class="node"><span class="sq"></span><span class="label">target</span></div>
       </div>
-      __RELAY_IPBOX__
       __RELAY_NOTICE__
     </main>
 
     <footer>
       <span id="originLabel"></span>
-      <span>build v0.13.0 · path-embedded __RELAY_LOGOUT_LINK__</span>
+      <span>build v0.13.0 · path-embedded</span>
     </footer>
   </div>
 
 <script>
 (function() {
-  var root = document.documentElement;
-  var sunPath = 'M12 2.4v2.4M12 19.2v2.4M4.4 12H2M22 12h-2.4M5.6 5.6l1.7 1.7M16.7 16.7l1.7 1.7M5.6 18.4l1.7-1.7M16.7 7.3l1.7-1.7';
-  var moonPath = 'M20 14.6A8.4 8.4 0 1 1 9.4 4a6.7 6.7 0 0 0 10.6 10.6z';
-
-  function applyIcon(theme) {
-    var circle = document.querySelector('#themeIcon circle');
-    var path = document.querySelector('#themeIcon path');
-    if (theme === 'dark') {
-      if (circle) circle.setAttribute('r', '0');
-      path.setAttribute('d', moonPath);
-    } else {
-      if (circle) circle.setAttribute('r', '4.6');
-      path.setAttribute('d', sunPath);
-    }
-  }
-
-  var saved = null;
-  try { saved = localStorage.getItem('relay-theme'); } catch (e) {}
-  var theme = saved || 'light';
-  root.setAttribute('data-theme', theme);
-  applyIcon(theme);
-
-  // Keep the mobile browser's chrome (address-bar / status-bar tint) in sync
-  // with the theme, instead of always advertising the light color.
-  var metaTheme = document.querySelector('meta[name="theme-color"]');
-  function applyThemeColor(t) {
-    if (metaTheme) metaTheme.setAttribute('content', t === 'dark' ? '#0A0A0C' : '#FFFFFF');
-  }
-  applyThemeColor(theme);
-
-  document.getElementById('themeToggle').addEventListener('click', function() {
-    theme = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-    root.setAttribute('data-theme', theme);
-    applyIcon(theme);
-    applyThemeColor(theme);
-    try { localStorage.setItem('relay-theme', theme); } catch (e) {}
-  });
-
   document.getElementById('originLabel').textContent = location.origin.replace(/^https?:\\/\\//, '');
 
   var input = document.getElementById('urlInput');
@@ -1227,57 +1206,6 @@ const HOME_HTML = `<!doctype html>
     e.preventDefault();
     go();
   });
-
-  // IP widget: your IP as Cloudflare sees it, and the IP sites see for the
-  // relay. TOGGLE-ONLY: the box ships hidden and nothing is fetched until the
-  // header's IP button turns it on; toggling it off aborts an in-flight
-  // lookup. No state is remembered — every fresh page load starts from off,
-  // so a plain visit never pays for an IP lookup round trip.
-  var ipBox = document.getElementById('ipbox');
-  var ipToggle = document.getElementById('ipToggle');
-  if (ipBox && ipToggle) {
-    var ipYou = document.getElementById('ipYou');
-    var ipRelay = document.getElementById('ipRelay');
-    var ipVia = document.getElementById('ipVia');
-    var ipCtl = null;
-    var ipAbort = function() {
-      if (ipCtl) { try { ipCtl.abort(); } catch (e) {} ipCtl = null; }
-    };
-    var ipLoad = function() {
-      ipYou.textContent = 'checking…';
-      ipRelay.textContent = 'checking…';
-      ipVia.textContent = '';
-      ipAbort();
-      try { if (typeof AbortController === 'function') ipCtl = new AbortController(); } catch (e) { ipCtl = null; }
-      var ipOpts = { cache: 'no-store', credentials: 'same-origin' };
-      if (ipCtl) ipOpts.signal = ipCtl.signal;
-      fetch('/__relay_ip', ipOpts).then(function(r) {
-        return r.json();
-      }).then(function(d) {
-        var y = d.you || {};
-        var bits = [y.ip || 'unknown'];
-        if (y.country) bits.push(y.country);
-        if (y.asn) bits.push('AS' + y.asn + (y.org ? ' ' + y.org : ''));
-        ipYou.textContent = bits.join(' · ');
-        ipRelay.textContent = d.relay ? d.relay.ip : 'unavailable';
-        ipVia.textContent = d.colo ? 'via Cloudflare ' + d.colo : '';
-      }).catch(function(err) {
-        if (err && err.name === 'AbortError') return;
-        ipYou.textContent = 'unavailable';
-        ipRelay.textContent = 'unavailable';
-      });
-    };
-    ipToggle.addEventListener('click', function() {
-      var show = ipBox.hidden;
-      ipBox.hidden = !show;
-      ipToggle.setAttribute('aria-pressed', show ? 'true' : 'false');
-      if (show) ipLoad(); else ipAbort();
-    });
-    document.getElementById('ipRefresh').addEventListener('click', function(e) {
-      e.preventDefault();
-      ipLoad();
-    });
-  }
 
   input.addEventListener('input', function() {
     hint.textContent = 'Prefix is optional — https:// is assumed.';
@@ -1605,48 +1533,272 @@ function errorResponse(proxyOrigin, status, title, message, detail, targetUrl) {
 }
 
 // The homepage is identical for every request with the same feature flags, so
-// it is built once per isolate instead of re-running four template
-// replacements (over ~20 KB of HTML) on every visit. Keyed on the only
-// inputs it has — everything else is baked in at deploy time.
+// it is built once per isolate instead of re-running template replacements on
+// every visit. Keyed on the only input it has.
 const HOME_HTML_CACHE = { key: '', html: '' };
 function buildHomeHtml(hasPassword) {
-  const key = (hasPassword ? 'P' : 'p') + (COOKIE_JAR ? 'C' : 'c') + (IP_WIDGET ? 'I' : 'i');
+  const key = hasPassword ? 'P' : 'p';
   if (HOME_HTML_CACHE.key === key) return HOME_HTML_CACHE.html;
-  // The log-out controls only exist when a password is configured —
-  // otherwise there's no session to log out of.
-  const footerLinks = [];
-  if (hasPassword) footerLinks.push(`<a href="${LOGOUT_PATH}" style="color:inherit;">log out</a>`);
-  if (COOKIE_JAR) footerLinks.push(`<a href="${COOKIES_PATH}" style="color:inherit;">cookies</a>`);
-  // Header controls. "IP" toggles the IP details box — off by default and
-  // never auto-restored (see IP_WIDGET). "Log out" ends the relay session and
-  // exists only with a password. "Sign out of sites" clears every site cookie
-  // in this browser (the sessions the cookie jar holds) in one press;
-  // "Cookies" is the manager.
-  const headerButtons = [];
-  if (IP_WIDGET) headerButtons.push('<button class="header-btn" id="ipToggle" type="button" aria-pressed="false" aria-controls="ipbox" title="Show or hide your IP details">IP</button>');
-  if (COOKIE_JAR) {
-    headerButtons.push(`<a class="header-btn" href="${COOKIES_PATH}">Cookies</a>`);
-    headerButtons.push(`<form class="header-form" method="POST" action="${COOKIES_PATH}"><input type="hidden" name="host" value="*"><button class="header-btn" type="submit" title="Clear every site's cookies in this browser">Sign out of sites</button></form>`);
-  }
-  if (hasPassword) headerButtons.push(`<a class="header-btn" href="${LOGOUT_PATH}">Log out</a>`);
+  // Everything else (theme, debug bar, IP, cookies, log out, browsing mode)
+  // lives on the Settings page.
+  const headerButtons = ['<a class="header-btn" href="' + SETTINGS_PATH + '">Settings</a>'];
   const notice = hasPassword
     ? ''
-    : '<p class="note">Password protection is off, so anyone with this address can use this relay, and there is no relay login to log out of. Set the <code>PASSWORD</code> secret to turn on a login — the <b>Log out</b> button appears here once it is set.</p>';
-  // Toggle-only: rendered hidden and never fetched until the header button
-  // turns it on. A reload starts from off again — no persistence, by design.
-  const ipBox = IP_WIDGET
-    ? '<div class="ipbox" id="ipbox" hidden aria-live="polite"><div class="ip-row"><span class="ip-label">you</span><span class="ip-val" id="ipYou">checking…</span></div>' +
-      '<div class="ip-row"><span class="ip-label">sites see</span><span class="ip-val" id="ipRelay">checking…</span></div>' +
-      '<div class="ip-foot"><span id="ipVia"></span><a href="#" id="ipRefresh">refresh</a></div></div>'
-    : '';
+    : '<p class="note">Password protection is off, so anyone with this address can use this relay, and there is no relay login to log out of. Set the <code>PASSWORD</code> secret to turn on a login — a <b>Log out</b> button then appears in Settings.</p>';
   const html = HOME_HTML
-    .replace('__RELAY_LOGOUT_LINK__', footerLinks.map((l) => ' · ' + l).join(''))
     .replace('__RELAY_HEADER_ACTIONS__', headerButtons.join(''))
-    .replace('__RELAY_IPBOX__', ipBox)
     .replace('__RELAY_NOTICE__', notice);
   HOME_HTML_CACHE.key = key;
   HOME_HTML_CACHE.html = html;
   return html;
+}
+
+// ---- Per-site browsing mode ---------------------------------------------------
+// Every site opens in original mode. A site the visitor switched to real-path
+// mode is listed (bare host, no "www.") in the MODE_COOKIE cookie, separated by
+// "|" (a character cookie values may carry).
+function normalizeSiteInput(input) {
+  let s = String(input || '').trim().toLowerCase();
+  if (!s) return null;
+  if (/^[a-z][a-z0-9+.-]*:\/\//.test(s)) {
+    try {
+      s = new URL(s).hostname;
+    } catch {
+      return null;
+    }
+  } else {
+    s = s.split(/[\/?#]/)[0].replace(/:\d+$/, '');
+  }
+  s = s.replace(/^www\./, '').replace(/\.$/, '');
+  if (s.length > 253 || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(s)) return null;
+  return s;
+}
+
+function getRealPathHosts(request) {
+  let raw = null;
+  try {
+    raw = relayGetCookie(request, MODE_COOKIE);
+  } catch {
+    raw = null;
+  }
+  if (!raw) return [];
+  const out = [];
+  for (const part of raw.split('|')) {
+    const h = normalizeSiteInput(part);
+    if (h && out.indexOf(h) === -1) out.push(h);
+    if (out.length >= MODE_MAX_SITES) break;
+  }
+  return out;
+}
+
+function isRealPathHost(hostname, list) {
+  if (!list || !list.length) return false;
+  return list.indexOf(String(hostname || '').toLowerCase().replace(/^www\./, '')) !== -1;
+}
+
+function modeCookieHeader(list) {
+  if (!list.length) return MODE_COOKIE + '=; Path=/; Max-Age=0; Secure; SameSite=Lax; HttpOnly';
+  return MODE_COOKIE + '=' + encodeURIComponent(list.join('|')) + '; Path=/; Max-Age=31536000; Secure; SameSite=Lax; HttpOnly';
+}
+
+// ---- Settings page ------------------------------------------------------------
+// o: { hasPassword, debugOn, realHosts, prefill, note, jar }
+function settingsPage(o) {
+  const e = escapeHtml;
+  const NOTES = {
+    real: 'Saved. That site now opens in real-path mode — reload it.',
+    original: 'Saved. That site now opens in original mode — reload it.',
+    invalid: 'That does not look like a site address (try poki.com).',
+    'debug-on': 'Debug bar is on for 24 hours.',
+    'debug-off': 'Debug bar is off.',
+    cookies: 'Cookies cleared.'
+  };
+  const noteText = Object.prototype.hasOwnProperty.call(NOTES, o.note) ? NOTES[o.note] : '';
+  const real = o.realHosts || [];
+
+  const form = (action, fields, label, cls) =>
+    '<form method="POST" action="' + SETTINGS_PATH + '"><input type="hidden" name="action" value="' + action + '">' +
+    Object.keys(fields).map((k) => '<input type="hidden" name="' + k + '" value="' + e(fields[k]) + '">').join('') +
+    '<button type="submit"' + (cls ? ' class="' + cls + '"' : '') + '>' + e(label) + '</button></form>';
+
+  // Mode section
+  let focus = '';
+  if (o.prefill) {
+    const isReal = real.indexOf(o.prefill) !== -1;
+    focus = '<div class="focus"><div class="row"><div><b>' + e(o.prefill) + '</b><div class="sub">Currently: ' +
+      (isReal ? 'real path' : 'original') + '</div></div>' +
+      (isReal ? form('mode_original', { site: o.prefill }, 'Switch to original') : form('mode_real', { site: o.prefill }, 'Switch to real path')) +
+      '</div></div>';
+  }
+  const modeRows = real.map((h) =>
+    '<div class="row"><div><b>' + e(h) + '</b><div class="sub">Real path</div></div>' + form('mode_original', { site: h }, 'Use original') + '</div>').join('');
+  const suggestions = SUGGESTED_REAL_PATH.filter((h) => real.indexOf(h) === -1)
+    .map((h) => form('mode_real', { site: h }, h, 'chip')).join('');
+
+  // Cookie jar section
+  let cookieSection = '';
+  if (COOKIE_JAR) {
+    const sites = new Map();
+    const now = Date.now();
+    for (const r of (o.jar ? o.jar.records : [])) {
+      if (r.exp && r.exp <= now) continue;
+      sites.set(r.key, (sites.get(r.key) || 0) + 1);
+    }
+    const list = [...sites.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    const rows = list.map(([h, n]) =>
+      '<div class="row"><div><b>' + e(h) + '</b><div class="sub">' + n + ' cookie' + (n === 1 ? '' : 's') + '</div></div>' +
+      form('cookies_clear', { host: h }, 'Clear') + '</div>').join('');
+    cookieSection = '<section><h2>Cookie jar</h2><p>Cookies for the sites you browse are kept in this browser, on the relay\'s own address, and sent to each site as if it had set them. Clearing them signs you out of those sites.</p>' +
+      (rows || '<p class="sub">No site cookies stored.</p>') +
+      (rows ? '<div class="actions">' + form('cookies_clear_all', {}, 'Clear all cookies') + '<a class="btn" href="' + COOKIES_PATH + '">Cookie names</a></div>' : '') +
+      '</section>';
+  }
+
+  const ipSection = IP_WIDGET
+    ? '<section><h2>Your IP</h2><p>Your address as Cloudflare sees it, and the address sites see when the relay fetches for you. Nothing is looked up until you press the button.</p>' +
+      '<div class="actions"><button type="button" id="ipBtn">Check my IP</button></div>' +
+      '<div class="ipbox" id="ipbox" hidden><div class="row2"><span class="lbl">you</span><span id="ipYou"></span></div>' +
+      '<div class="row2"><span class="lbl">sites see</span><span id="ipRelay"></span></div><div class="sub" id="ipVia"></div></div></section>'
+    : '';
+
+  const sessionSection = o.hasPassword
+    ? '<section><h2>Session</h2><div class="actions"><a class="btn" href="' + LOGOUT_PATH + '">Log out</a></div></section>'
+    : '';
+
+  return `<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#FFFFFF">
+<title>Relay — Settings</title>
+<script>try{var t=localStorage.getItem('relay-theme');if(t==='dark'||t==='light')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+<style>
+  :root { --bg:#FFFFFF; --surface:#F6F6F5; --border:#E1E1DE; --text:#131316; --text-dim:#6C6C72; --accent:#2547F4; --warn:#C7431E; }
+  html[data-theme="dark"] { --bg:#0A0A0C; --surface:#151517; --border:#29292D; --text:#F1F1EF; --text-dim:#8B8B91; --accent:#6C89FF; --warn:#FF8A63; }
+  * { box-sizing: border-box; }
+  button, a, input { touch-action: manipulation; }
+  [hidden] { display: none !important; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; -webkit-tap-highlight-color:transparent; }
+  .wrap { max-width:600px; margin:0 auto; padding:max(28px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(60px, calc(40px + env(safe-area-inset-bottom))) max(24px, env(safe-area-inset-left)); }
+  .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:28px; }
+  .top a { color:var(--text-dim); text-decoration:none; font-family:ui-monospace,monospace; font-size:13px; letter-spacing:.08em; text-transform:uppercase; }
+  h1 { font-size:28px; margin:0 0 20px; letter-spacing:-0.02em; }
+  h2 { font-size:15px; margin:0 0 8px; text-transform:uppercase; letter-spacing:.08em; font-family:ui-monospace,monospace; color:var(--accent); font-weight:500; }
+  section { border-top:1px solid var(--border); padding:22px 0; }
+  p { font-size:14px; line-height:1.5; color:var(--text-dim); margin:0 0 14px; }
+  .sub { font-size:12px; color:var(--text-dim); margin-top:2px; }
+  .msg { border:1px solid var(--accent); border-radius:4px; padding:10px 12px; font-size:14px; margin:0 0 18px; background:var(--surface); }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 0; border-bottom:1px solid var(--border); word-break:break-all; }
+  .row b { font-weight:500; font-size:14px; }
+  .focus { border:1px solid var(--accent); border-radius:4px; padding:2px 12px; margin:0 0 16px; background:var(--surface); }
+  .focus .row { border-bottom:0; }
+  .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
+  form { margin:0; }
+  button, .btn { border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:4px; padding:9px 14px; cursor:pointer; font-size:13px; text-decoration:none; display:inline-block; font-family:inherit; }
+  button:hover, .btn:hover { border-color:var(--text-dim); }
+  button[aria-pressed="true"] { border-color:var(--accent); color:var(--accent); }
+  .chip { font-family:ui-monospace,monospace; font-size:12px; padding:7px 10px; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  .field { display:flex; gap:8px; margin-top:12px; }
+  .field input { flex:1; min-width:0; border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:4px; padding:10px 12px; font-size:16px; font-family:ui-monospace,monospace; }
+  .ipbox { margin-top:12px; border:1px solid var(--border); border-radius:4px; background:var(--surface); padding:8px 12px; font-family:ui-monospace,monospace; font-size:12px; }
+  .row2 { display:flex; gap:12px; padding:4px 0; word-break:break-all; }
+  .lbl { flex:0 0 78px; color:var(--text-dim); text-transform:uppercase; font-size:11px; letter-spacing:.08em; }
+  .state { font-family:ui-monospace,monospace; font-size:12px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top"><a href="/">&larr; relay</a></div>
+    <h1>Settings</h1>
+    ${noteText ? '<div class="msg">' + e(noteText) + '</div>' : ''}
+
+    <section>
+      <h2>Appearance</h2>
+      <p>Light or dark theme. Remembered in this browser.</p>
+      <div class="actions">
+        <button type="button" id="themeLight" aria-pressed="false">Light</button>
+        <button type="button" id="themeDark" aria-pressed="false">Dark</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Browsing mode</h2>
+      <p><b>Original</b> is the default for every site: the address contains the site (<span class="state">${e(o.proxyHost)}/https://site.com</span>). <b>Real path</b> keeps the site's own address in the bar and is needed by sites that render nothing in original mode (Poki, GitHub...). The choice is remembered per site in this browser.</p>
+      ${focus}
+      ${modeRows ? '<div>' + modeRows + '</div>' : '<p class="sub">No site is using real path.</p>'}
+      <form method="POST" action="${SETTINGS_PATH}">
+        <input type="hidden" name="action" value="mode_real">
+        <div class="field"><input name="site" placeholder="poki.com" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" inputmode="url"><button type="submit">Use real path</button></div>
+      </form>
+      ${suggestions ? '<p class="sub" style="margin-top:14px">Sites known to need real path:</p><div class="chips">' + suggestions + '</div>' : ''}
+    </section>
+
+    <section>
+      <h2>Debug bar</h2>
+      <p>Shows the small “relay” button on every page, with the failed-request log, a Link button and a Mode button for the current site. Turns itself off after 24 hours.</p>
+      <p class="state">Status: ${o.debugOn ? 'on' : 'off'}</p>
+      <div class="actions">${o.debugOn ? form('debug_off', {}, 'Turn off') : form('debug_on', {}, 'Turn on')}</div>
+    </section>
+
+    ${ipSection}
+    ${cookieSection}
+    ${sessionSection}
+  </div>
+
+<script>
+(function() {
+  var root = document.documentElement;
+  var bl = document.getElementById('themeLight');
+  var bd = document.getElementById('themeDark');
+  function mark() {
+    var t = root.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+    bl.setAttribute('aria-pressed', t === 'light' ? 'true' : 'false');
+    bd.setAttribute('aria-pressed', t === 'dark' ? 'true' : 'false');
+    var m = document.querySelector('meta[name="theme-color"]');
+    if (m) m.setAttribute('content', t === 'dark' ? '#0A0A0C' : '#FFFFFF');
+  }
+  function setTheme(t) {
+    root.setAttribute('data-theme', t);
+    try { localStorage.setItem('relay-theme', t); } catch (e) {}
+    mark();
+  }
+  bl.addEventListener('click', function() { setTheme('light'); });
+  bd.addEventListener('click', function() { setTheme('dark'); });
+  mark();
+
+  var ipBtn = document.getElementById('ipBtn');
+  if (ipBtn) {
+    ipBtn.addEventListener('click', function() {
+      var box = document.getElementById('ipbox');
+      var you = document.getElementById('ipYou');
+      var rel = document.getElementById('ipRelay');
+      var via = document.getElementById('ipVia');
+      box.hidden = false;
+      you.textContent = 'checking…';
+      rel.textContent = 'checking…';
+      via.textContent = '';
+      fetch('/__relay_ip', { cache: 'no-store', credentials: 'same-origin' }).then(function(r) {
+        return r.json();
+      }).then(function(d) {
+        var y = d.you || {};
+        var bits = [y.ip || 'unknown'];
+        if (y.country) bits.push(y.country);
+        if (y.asn) bits.push('AS' + y.asn + (y.org ? ' ' + y.org : ''));
+        you.textContent = bits.join(' · ');
+        rel.textContent = d.relay ? d.relay.ip : 'unavailable';
+        via.textContent = d.colo ? 'via Cloudflare ' + d.colo : '';
+      }).catch(function() {
+        you.textContent = 'unavailable';
+        rel.textContent = 'unavailable';
+      });
+    });
+  }
+})();
+</script>
+</body>
+</html>`;
 }
 
 // ETag for the Service Worker script: the browser re-checks for an updated SW
@@ -2021,6 +2173,69 @@ async function handleRelayRequest(request, env, ctx) {
       return ipInfoResponse(request);
     }
 
+    // Settings page (theme, browsing mode, debug bar, IP, cookie jar, log out).
+    // Like /login and /cookies, a proxied site's own /settings link that escaped
+    // to this origin is repaired from the Referer instead (see isRelayOwnRequest).
+    if (url.pathname === SETTINGS_PATH && isRelayOwnRequest(request, url, proxyOrigin)) {
+      const rpHosts = getRealPathHosts(request);
+      if (request.method === 'POST') {
+        let form;
+        try {
+          form = await request.formData();
+        } catch {
+          return Response.redirect(proxyOrigin + SETTINGS_PATH, 302);
+        }
+        const action = String(form.get('action') || '');
+        const headers = new Headers();
+        let note = '';
+        if (action === 'mode_real' || action === 'mode_original') {
+          const site = normalizeSiteInput(form.get('site'));
+          const relayHostBare = new URL(proxyOrigin).hostname.replace(/^www\./, '');
+          if (!site || site === relayHostBare) {
+            note = 'invalid';
+          } else {
+            const next = rpHosts.filter((h) => h !== site);
+            if (action === 'mode_real') {
+              if (next.length >= MODE_MAX_SITES) next.shift();
+              next.push(site);
+              note = 'real';
+            } else {
+              note = 'original';
+            }
+            headers.append('Set-Cookie', modeCookieHeader(next));
+            // A stale real-path context would otherwise keep re-routing bare paths.
+            headers.append('Set-Cookie', CTX_COOKIE + '=; Path=/; Max-Age=0; Secure; SameSite=Lax');
+          }
+        } else if (action === 'debug_on' || action === 'debug_off') {
+          const on = action === 'debug_on';
+          headers.append('Set-Cookie', '__relay_debug=' + (on ? '1' : '') + '; Path=/; Max-Age=' + (on ? 86400 : 0) + '; Secure; SameSite=Lax');
+          note = on ? 'debug-on' : 'debug-off';
+        } else if (COOKIE_JAR && (action === 'cookies_clear_all' || action === 'cookies_clear')) {
+          const which = action === 'cookies_clear_all' ? '*' : String(form.get('host') || '');
+          const jarNow = loadJar(request);
+          for (const [name, meta] of jarNow.raw) {
+            if (which === '*' || meta.key === which) headers.append('Set-Cookie', jarExpireHeader(name));
+          }
+          note = 'cookies';
+        }
+        headers.set('Location', proxyOrigin + SETTINGS_PATH + (note ? '?note=' + note : ''));
+        return new Response(null, { status: 302, headers });
+      }
+      const settingsHtml = settingsPage({
+        proxyHost: new URL(proxyOrigin).host,
+        hasPassword: !!(env && env.PASSWORD),
+        debugOn: /(?:^|;\s*)__relay_debug=1/.test(request.headers.get('Cookie') || ''),
+        realHosts: rpHosts,
+        prefill: normalizeSiteInput(url.searchParams.get('site')),
+        note: url.searchParams.get('note') || '',
+        jar: COOKIE_JAR ? loadJar(request) : null
+      });
+      return new Response(settingsHtml, {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
+      });
+    }
+
     // Cookie manager: lists the sites that have cookies in this browser's jar
     // and clears them. Like /login, a proxied site's own /cookies link that
     // escaped to this origin is repaired from the Referer instead.
@@ -2078,7 +2293,7 @@ async function handleRelayRequest(request, env, ctx) {
     // page issued the request — and redirect to the corrected URL rather
     // than silently failing or mis-serving it.
     if (!alreadyEmbedded) {
-      // Real-path-mode context (see REAL_PATH_HOSTS): the address bar holds a
+      // Real-path-mode context (see MODE_COOKIE): the address bar holds a
       // bare real path, so Referer can't say which site it belongs to. The
       // injected script left the real origin in a cookie.
       let ctxOrigin = null;
@@ -2524,7 +2739,7 @@ async function handleRelayRequest(request, env, ctx) {
     let spoofPath = '';
     try {
       const finalForPath = new URL(baseUrl);
-      if (REAL_PATH_HOSTS.test(finalForPath.hostname)) spoofPath = finalForPath.pathname + finalForPath.search;
+      if (isRealPathHost(finalForPath.hostname, getRealPathHosts(request))) spoofPath = finalForPath.pathname + finalForPath.search;
     } catch {
       // leave empty
     }
@@ -3202,7 +3417,7 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       var proxyOrigin = '${proxyOrigin}';
       // Per-page settings from the small inline config script the server puts in
       // front of this file (see ScriptInjector). Missing = normal mode.
-      // Real-path mode (see REAL_PATH_HOSTS on the server). Empty = normal mode.
+      // Real-path mode (see MODE_COOKIE on the server). Empty = normal mode.
       var relaySpoofPath = String((self.__relayCfg && self.__relayCfg.p) || "");
       var relaySpoofReal = '';
       // Game context (see GAME_MODE on the server): keeps the relay's debug
@@ -3728,6 +3943,8 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           '<span style="display:flex;gap:10px;align-items:center;">' +
           '<button id="__relay_debug_ip" title="Show your IP and the IP sites see" style="background:none;border:1px solid #444;' +
           'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:4px 9px;">IP</button>' +
+          '<button id="__relay_debug_mode" title="Switch this site between original and real-path mode" style="background:none;border:1px solid #444;' +
+          'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:4px 9px;">Mode</button>' +
           '<button id="__relay_debug_link" title="Copy a relay link to this page" style="background:none;border:1px solid #444;' +
           'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:4px 9px;">Link</button>' +
           '<button id="__relay_debug_copy" style="background:none;border:1px solid #444;' +
@@ -3759,6 +3976,12 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           // Only a real click by the person: a page script calling .click() is ignored.
           if (e.isTrusted === false) return;
           relayLoadIps();
+        });
+        document.getElementById('__relay_debug_mode').addEventListener('click', function(e) {
+          if (e.isTrusted === false) return;
+          try {
+            window.location.href = proxyOrigin + '/settings?site=' + encodeURIComponent(new URL(relayCurrentRealUrl()).hostname);
+          } catch (x) {}
         });
         document.getElementById('__relay_debug_link').addEventListener('click', function() {
           var lbtn = document.getElementById('__relay_debug_link');
