@@ -1,5 +1,95 @@
 # Changelog
 
+## v0.12.0
+
+### Added
+- IP widget toggle. The homepage IP widget no longer shows itself on load: the
+  two lines — **you**, the visitor's IP as Cloudflare sees it
+  (`CF-Connecting-IP`) with country and network, and **sites see**, the relay's
+  outbound IP, plus the data center and the refresh link — now start folded
+  behind a small **IP** button under the address bar, and pressing it toggles
+  the readout open and closed. Off is the default on every page load, and the
+  choice is deliberately not remembered — no cookie, no `localStorage`, nothing
+  — so it can never stay on automatically; an IP readout that turns itself back
+  on would stop being one. The `/__relay_ip` fetch moved with it: nothing is
+  requested until the first press, so a visitor who never opens the widget
+  never triggers the lookup or the outbound-IP echo behind it, and the
+  homepage HTML still never contains an IP. The readout is held in memory only,
+  until the page unloads; the refresh link still forces a new lookup;
+  everything rendered is still escaped and nothing is stored. The diagnostic
+  panel's **IP** button already fetched only when pressed and is unchanged.
+  `IP_WIDGET` itself stays on by default; set it to `false` and the widget,
+  the toggle and the endpoint all disappear together.
+
+### Changed
+- Stability, the priority for this release. The rule the pass follows: one
+  failure may cost one feature, never the page and never the relay. On the
+  client, every patch the injected script installs — the attribute and
+  property hooks, `fetch`, XHR, `WebSocket`, `EventSource`, `window.open`,
+  `postMessage`, the history wrappers, the submit and click handlers, the
+  `MutationObserver`, the captcha and tracking-redirect repairs, the panel
+  and the IP widget — is applied only after a feature test and runs inside
+  its own `try`/`catch` (the v0.5.0 guard covered only the prototype
+  reassignments), so a browser without an API skips that one patch instead of
+  dying mid-install, and a patch that throws logs one panel entry and hands
+  back the native behaviour while the page keeps working. If the injected
+  script itself fails to parse or install, the load-bearing server-side
+  layers — `<base>`, `HTMLRewriter` rewriting, Referer recovery, the
+  WebSocket bridge — carry the page alone, exactly as they did before the
+  client script existed (v0.5.0 through v0.8.0 proved they do). On the
+  server, the rewrite path is isolated the same way: an element handler that
+  throws no longer aborts the `HTMLRewriter` stream mid-body — that element
+  passes through unrewritten and the rest of the document still reaches the
+  browser — and an unexpected error after the upstream response has arrived
+  falls back to returning that response with the headers corrected and the
+  body untouched, instead of Cloudflare's Worker-exception page. No
+  site-facing rewrite rule changed in this release: every change here is
+  isolation, feature detection or caching with identical output, so nothing
+  that worked in v0.11.0 stops working.
+- Speed. Fast paths added behind the stability guard, with no change to any
+  rewritten byte:
+  - static-asset fast path: requests whose path ends in a static extension
+    (`js`, `css`, images, fonts, media) skip the page-context resolution, the
+    escape-repair probes and the rewriter decision tree and go straight to
+    the upstream fetch and the cache rules; with the jar on their cookies are
+    still attached — only the page-only work is skipped — and the response's
+    `Content-Type` still has the final word if an "asset" turns out to be a
+    document;
+  - on-demand injection: the load-bearing patches install during script
+    evaluation exactly as before, but the diagnostic panel and the IP widget
+    are built after the `load` event or on first use, so the diagnostics
+    never compete with the page's own boot;
+  - one rewriter pass: all element handlers (anchors, media, forms, meta
+    referrer, `<base>`, the script injection) attach to a single
+    `HTMLRewriter` chain, so the body is traversed once;
+  - the injected-script cache holds one minified string per variant (debug
+    off/on), with the real-path substitution still applied per request, so
+    toggling debug mode no longer rebuilds anything;
+  - the relay's Service Worker routes the collapsed `/https:/…` form,
+    `/favicon.ico` and `/robots.txt` straight to the network like the
+    `/http…` route, so the Worker is not woken for them.
+- Mobile support, for the relay's own UI only — nothing extra is injected
+  into proxied pages for it, so no target renders differently:
+  - tap targets: the panel's collapsed button and its controls, the homepage
+    header buttons and the new IP toggle meet the ~44 px coarse-pointer
+    minimum;
+  - the panel never widens a phone: it is capped to the viewport, its log
+    lines wrap instead of scrolling the page sideways, and it clears the
+    notch and home indicator via `env(safe-area-inset-*)`;
+  - the homepage and login address fields are 16 px or larger, so iOS Safari
+    does not zoom the page when the keyboard opens;
+  - the homepage folds to a single column on narrow screens, with the header
+    controls wrapping instead of overflowing.
+- Version markers: the homepage footer reads `build v0.12.0 · path-embedded`
+  and the panel header `relay v0.12.0 — failed requests`.
+
+### Fixed
+- The homepage IP widget fetched `/__relay_ip` on every homepage load even
+  for visitors who never opened the readout (see Added: the fetch is now part
+  of the toggle).
+- Long log lines in the diagnostic panel could push the whole page sideways
+  on phones instead of scrolling only the log (see Changed: mobile support).
+
 ## v0.11.0
 
 ### Added
@@ -419,10 +509,7 @@
   diffs see nothing to leak — and reads return the original URL, so
   frameworks like React find no mismatch and stop reverting the rewrite.
   This ended the earlier reactive arms race (observer, polling, hover
-  re-assertion), which could only race a revert loop. Technique taken from
-  a reference implementation (cf-proxy-ex) — only the technique, not its
-  location string-replacement, cookie handling, password page or
-  `document.write`.
+  re-assertion), which could only race a revert loop.
 - Client-side patch suite: `EventSource`, `window.open`, `postMessage`
   (target origin widened to `*`), `pushState`/`replaceState` with `<base>`
   kept in sync, `form.submit()`, blocking the target site's own Service
@@ -534,3 +621,4 @@
   stay inside the relay.
 - Homepage with an address field; the real request method and body
   forwarded.
+
