@@ -194,6 +194,17 @@ const GAME_BLOCK_ADS = false;
 const GAME_AD_HOSTS = /(^|\.)(googlesyndication\.com|doubleclick\.net|googleadservices\.com|googletagservices\.com|googletagmanager\.com|google-analytics\.com|imasdk\.googleapis\.com|2mdn\.net|adnxs\.com|amazon-adsystem\.com|criteo\.(com|net)|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|smartadserver\.com|adsafeprotected\.com|moatads\.com|scorecardresearch\.com|hotjar\.com|connect\.facebook\.net|mc\.yandex\.(ru|com)|an\.yandex\.ru|adfox\.yandex\.ru|adfox\.ru|yandexadexchange\.net|yabs\.yandex\.ru|adfstat\.yandex\.ru)$/i;
 // File types that count as game assets: edge-cached and long-cached even when
 // fetched via fetch()/XHR (which the normal rules treat as uncacheable).
+// Hosts that serve the GAME ITSELF (the iframe document), as opposed to the
+// portal around it. Their pages are a canvas and a script: the client script
+// runs in "lean" mode there (no DOM mutation watcher, which only costs frame
+// time on a page that keeps updating its own DOM). A host missing from this list
+// still gets lean mode at runtime when it has a canvas and almost no links.
+const GAME_FRAME_HOSTS = /(^|\.)(poki-gdn\.com|html5\.gamedistribution\.com|itch\.zone|ungrounded\.net|gamemonetize\.co|games\.crazygames\.com|yandex\.net|yastatic\.net)$/i;
+// Game traffic is retried more eagerly than ordinary browsing: one server-side
+// retry of a GET that failed with a transient 5xx / Cloudflare edge status, and
+// up to two client-side retries of a game's fetch() on a network error or such a
+// status. A game that fails to load one asset usually stops loading altogether.
+const GAME_RETRY = true;
 const GAME_ASSET_PATH = /\.(wasm|unityweb|data|bundle|pck|mem|symbols|glb|gltf|ktx2|basis|atlas|skel|fnt|ogg|mp3|wav|m4a|br|gz)$/i;
 
 // ---- IP widget ----------------------------------------------------------------
@@ -1983,7 +1994,7 @@ async function handleWebSocketUpgrade(request, url, proxyOrigin) {
     // lifetime — once upstream.webSocket exists below, it's independent of
     // this timeout) while still failing fast on an unreachable game server
     // rather than leaving the connecting UI hanging indefinitely.
-    upstream = await fetchUpstream(httpEquivalent, { headers: upstreamHeaders }, 10000);
+    upstream = await fetchUpstream(httpEquivalent, { headers: upstreamHeaders }, 10000, { retry5xx: true });
   } catch (err) {
     return new Response('WebSocket upstream connection failed: ' + err.message, { status: 502 });
   }
@@ -2527,7 +2538,7 @@ async function handleRelayRequest(request, env, ctx) {
       // relying on 0-TTL handling.
       cf: (noEdgeCache || cookieHeader || (jarOn && !gameAsset && !/^(script|style|image|font)$/.test(fetchDest)))
         ? undefined
-        : { cacheEverything: true, cacheTtlByStatus: { '200-299': 300, '400-499': 1, '500-599': 1 } }
+        : { cacheEverything: true, cacheTtlByStatus: { '200-299': gameAsset ? 86400 : (gameCtx ? 3600 : 300), '400-499': 1, '500-599': 1 } }
     };
     if (cookieHeader) upstreamInit.headers.set('Cookie', cookieHeader);
 
@@ -2550,10 +2561,10 @@ async function handleRelayRequest(request, env, ctx) {
         // method and body semantics, the address bar and one-shot content all
         // behave naturally - and each hop passes through the Worker again, so
         // cookies set on a redirect are stored before the next hop is made.
-        upstream = await fetchUpstream(upstreamHref, Object.assign({}, upstreamInit, { redirect: 'manual' }));
+        upstream = await fetchUpstream(upstreamHref, Object.assign({}, upstreamInit, { redirect: 'manual' }), undefined, { retry5xx: gameCtx && GAME_RETRY });
         storeSetCookies(jar, new URL(upstreamHref), getSetCookies(upstream.headers));
       } else {
-        upstream = await fetchUpstream(upstreamHref, upstreamInit);
+        upstream = await fetchUpstream(upstreamHref, upstreamInit, undefined, { retry5xx: gameCtx && GAME_RETRY });
       }
     } catch (error) {
       return errorResponse(proxyOrigin, 502, "Couldn't reach that address", 'The request to the target failed before any response came back.', (derivedHostHint(parsedTarget.hostname, proxyOrigin) + ' ' + error.message).trim(), parsedTarget.href);
@@ -2681,9 +2692,18 @@ async function handleRelayRequest(request, env, ctx) {
         // the 24 h extension actually helps.
         const upstreamCC = (headers.get('Cache-Control') || '').toLowerCase();
         const maxAgeMatch = upstreamCC.match(/max-age\s*=\s*(\d+)/);
-        const upstreamForbids = /(?:^|,)\s*(?:no-store|no-cache|private)\b/.test(upstreamCC) ||
+        const hardForbids = /(?:^|,)\s*(?:no-store|private)\b/.test(upstreamCC);
+        let upstreamForbids = hardForbids || /(?:^|,)\s*no-cache\b/.test(upstreamCC) ||
           (maxAgeMatch ? parseInt(maxAgeMatch[1], 10) === 0 : false);
-        if (!upstreamForbids && !maxAgeMatch) headers.set('Cache-Control', 'public, max-age=86400');
+        if (gameAsset && upstreamForbids && !hardForbids) {
+          // Versioned game bundles are often sent no-cache / max-age=0, which
+          // makes every replay re-download them (and burns Worker requests).
+          // Keep them for an hour; no-store and private are still honoured.
+          headers.set('Cache-Control', 'public, max-age=3600');
+          upstreamForbids = false;
+        } else if (!upstreamForbids && !maxAgeMatch) {
+          headers.set('Cache-Control', 'public, max-age=86400');
+        }
         withJarCookies(headers, jarSetCookies);
         const asset = new Response(upstream.body, {
           status: upstream.status,
@@ -2747,6 +2767,16 @@ async function handleRelayRequest(request, env, ctx) {
     // The injected client script lives at INJECT_PATH (cached for a year); the
     // page only gets a tiny config script plus a <script src> carrying the hash.
     const injected = await getInjected(proxyOrigin, COOKIE_JAR);
+    // A document served by a host that hosts the game itself runs the client
+    // script in lean mode (see GAME_FRAME_HOSTS).
+    let leanFrame = false;
+    if (GAME_MODE) {
+      try {
+        leanFrame = GAME_FRAME_HOSTS.test(new URL(baseUrl).hostname);
+      } catch {
+        leanFrame = false;
+      }
+    }
 
     const rewriter = new HTMLRewriter()
       .on('meta[name]', new MetaReferrerRewriter())
@@ -2771,7 +2801,7 @@ async function handleRelayRequest(request, env, ctx) {
       .on('meta[http-equiv]', new MetaRefreshRewriter(baseUrl, proxyOrigin))
       .on('meta[http-equiv]', new MetaCspRemover())
       .on('head', new BaseTagInjector(proxiedBase))
-      .on('head', new ScriptInjector(proxyOrigin, spoofPath, gameCtx, injected.ver));
+      .on('head', new ScriptInjector(proxyOrigin, spoofPath, gameCtx, injected.ver, leanFrame));
 
     const transformed = rewriter.transform(upstream);
 
@@ -2973,7 +3003,7 @@ async function fetchWithTimeout(url, init, timeoutMs) {
 // making a real rate limit more likely to be hit than for ordinary
 // browsing. Capped at 2s and one attempt so a single request can never
 // stall for long chasing a throttle that isn't going to clear soon.
-async function fetchUpstream(url, init, timeoutMs) {
+async function fetchUpstream(url, init, timeoutMs, opts) {
   const method = String(init.method || 'GET').toUpperCase();
   const retryable = !init.body && (method === 'GET' || method === 'HEAD');
   let response;
@@ -2996,8 +3026,20 @@ async function fetchUpstream(url, init, timeoutMs) {
     }
   }
 
+  // Game traffic (opts.retry5xx): one more try, shortly after, for a transient
+  // server error or a Cloudflare edge status. Only for GET/HEAD without a body.
+  if (opts && opts.retry5xx && retryable && TRANSIENT_STATUSES.has(response.status)) {
+    await sleep(250);
+    try {
+      response = await fetchWithTimeout(url, init, timeoutMs);
+    } catch {
+      // keep the failed response; the caller shows its own error
+    }
+  }
+
   return response;
 }
+const TRANSIENT_STATUSES = new Set([500, 502, 503, 504, 520, 521, 522, 523, 524]);
 
 // Content-types safe to cache aggressively client-side: static, commonly
 // content-hashed, and re-requested often by proxied SPAs. Deliberately
@@ -3395,15 +3437,16 @@ async function getInjected(proxyOrigin, cookieJar) {
 // cacheable file. If an inline script is ever blocked the file falls back to
 // normal mode, so a failure here costs a feature, never the page.
 class ScriptInjector {
-  constructor(proxyOrigin, realPath, gameMode, ver) {
+  constructor(proxyOrigin, realPath, gameMode, ver, lean) {
     this.proxyOrigin = proxyOrigin;
     this.realPath = realPath || '';
     this.gameMode = !!gameMode;
     this.ver = ver;
+    this.lean = !!lean;
   }
   element(el) {
     const cfg = 'window.__relayCfg={p:' + JSON.stringify(this.realPath).replace(/</g, '\\u003c') +
-      ',g:' + (this.gameMode ? 1 : 0) + '};';
+      ',g:' + (this.gameMode ? 1 : 0) + ',l:' + (this.lean ? 1 : 0) + '};';
     const src = this.proxyOrigin + INJECT_PATH + '?v=' + this.ver;
     el.prepend('<script>' + cfg + '</script><script src="' + escapeHtml(src) + '"></script>', { html: true });
   }
@@ -3423,6 +3466,9 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       // Game context (see GAME_MODE on the server): keeps the relay's debug
       // button from covering a game unless debug mode is on.
       var relayGame = !!(self.__relayCfg && self.__relayCfg.g);
+      // Lean mode: this document hosts a game itself (see GAME_FRAME_HOSTS), so
+      // the DOM mutation watcher is not started.
+      var relayLean = !!(self.__relayCfg && self.__relayCfg.l);
       // Cookie jar (see COOKIE_JAR on the server): document.cookie is replaced
       // by a shim over the jar cookies. Everything in this script that needs
       // the page's REAL cookie string (the relay's own debug and context
@@ -4172,6 +4218,35 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       // objects, and Request objects.
       try {
         var origFetch = window.fetch;
+        // Game context only: a GET that fails with a network error or a transient
+        // 5xx / Cloudflare edge status is tried again (up to two more times, after
+        // 0.4 s and 1.2 s). A game that cannot load one asset usually stops.
+        var RELAY_RETRY_STATUS = { 502: 1, 503: 1, 504: 1, 520: 1, 521: 1, 522: 1, 523: 1, 524: 1 };
+        var relayFetchRetry = function(self, p, init, method) {
+          var attempt = 0;
+          var m = String(method || 'GET').toUpperCase();
+          var sig = (init && init.signal) || (p && typeof p === 'object' && p.signal) || null;
+          var can = function() {
+            if (!relayGame || attempt >= 2) return false;
+            if (m !== 'GET' && m !== 'HEAD') return false;
+            if (sig && sig.aborted) return false;
+            return true;
+          };
+          var wait = function() {
+            attempt++;
+            return new Promise(function(r) { setTimeout(r, attempt === 1 ? 400 : 1200); });
+          };
+          var go = function() {
+            return origFetch.call(self, p, init).then(function(res) {
+              if (RELAY_RETRY_STATUS[res.status] && can()) return wait().then(go);
+              return res;
+            }, function(err) {
+              if (can() && !(err && err.name === 'AbortError')) return wait().then(go);
+              throw err;
+            });
+          };
+          return go();
+        };
         window.fetch = function(input, init) {
           var self = this;
           var method = (init && init.method) || (input && input.method) || 'GET';
@@ -4207,9 +4282,9 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
                 delete relayRestInit.credentials;
                 delete relayRestInit.redirect;
               } catch (e) { relayRestInit = null; }
-              if (relayRestInit) return origFetch.call(self, p, relayRestInit);
+              if (relayRestInit) return relayFetchRetry(self, p, relayRestInit, method);
             }
-            return origFetch.call(self, p, init);
+            return relayFetchRetry(self, p, init, method);
           }).then(function(res) {
             if (!res.ok) {
               if (RELAY_DEBUG) {
@@ -4721,8 +4796,9 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
         setTimeout(relaySweepWhenIdle, 8000);
       }
 
-      if (typeof MutationObserver === 'function') {
-        var relayObserver = new MutationObserver(function(mutations) {
+      var relayObserver = null;
+      if (typeof MutationObserver === 'function' && !relayLean) {
+        relayObserver = new MutationObserver(function(mutations) {
           var added = [];
           for (var i = 0; i < mutations.length; i++) {
             var addedNodes = mutations[i].addedNodes;
@@ -4744,6 +4820,17 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           }
         });
         relayObserver.observe(document.documentElement, { childList: true, subtree: true });
+      }
+      // A game page the list did not know: a canvas and almost no links means the
+      // DOM watcher has nothing to repair and only costs frame time.
+      if (relayGame && !relayLean) {
+        window.addEventListener('load', function() {
+          try {
+            if (relayObserver && document.querySelector('canvas') && document.querySelectorAll('a[href]').length < 5) {
+              relayObserver.disconnect();
+            }
+          } catch (e) {}
+        });
       }
 
       // Link click interception. Capture phase: must run BEFORE the page's
