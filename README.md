@@ -52,14 +52,14 @@ Local note: the session cookie is `Secure`, so the gate loops on plain-HTTP
 | Path | Purpose |
 |---|---|
 | `/login` | Login form. Unauthenticated requests redirect here with `?redirect=<where you were going>`. |
-| `/logout` | Expires the session cookie. Reached from the **Log out** button in the homepage header and the footer link, both shown only when a password is set. Bookmark it for shared machines. |
+| `/logout` | Expires the session cookie. Reached from **Log out** on the Settings page, shown only when a password is set. Bookmark it for shared machines. |
 
 The old `/__relay_login` and `/__relay_logout` URLs redirect to these.
 `/login` and `/logout` are short names that proxied sites use too, so a request
 for one (GET or POST) whose `Referer` is a proxied page is treated as that
 site's own link and repaired like any other escape; typed or bookmarked visits,
 the relay's own login form and the login redirect (`?redirect=`) are the
-relay's.
+relay's. `/settings` and `/cookies` follow the same rule.
 
 The session cookie holds a SHA-256 hash of the password (not the password),
 `HttpOnly; Secure; SameSite=Lax`, 30 days. See *Limitations* for what this
@@ -82,72 +82,146 @@ by the Worker.
 
 Open `https://relay.<username>.workers.dev/`, enter an address, and browse
 normally. Bare domains work too (`/example.com` assumes `https://`). Old
-`?url=` links redirect to the canonical form.
+`?url=` links redirect to the canonical form. Every site opens in **original**
+mode (the address contains the site: `relay/https://site.com`) unless you
+switched it to real-path mode in Settings.
 
-**Which version is live:** the homepage footer shows `build v0.11.0 ·
-path-embedded`, and the diagnostic panel header shows `relay v0.11.0 — failed
+**Which version is live:** the homepage footer shows `build v0.13.0 ·
+path-embedded`, and the diagnostic panel header shows `relay v0.13.0 — failed
 requests`. (Before v0.9.0 the panel header never actually rendered — the
 injected script was syntactically dead from v0.5.0 to v0.8.0; see
-`CHANGELOG.md`.) If you don't see v0.11.0, you're testing an old deploy.
+`CHANGELOG.md`.) If you don't see v0.13.0, you're testing an old deploy.
 
-**Homepage controls:** the header has **Cookies** (the cookie manager),
-**Sign out of sites** (one press clears every site's cookies in this browser)
-and, when a password is set, **Log out** (ends the relay session). The same
-links are in the footer. With no password set the homepage says the relay is
-open to anyone with the address and that there is no relay login to log out of.
+**Homepage:** the address field, and one **Settings** button in the header.
+Everything that used to be in the header — the IP lines, **Cookies**, **Sign
+out of sites**, **Log out**, the theme toggle — moved to the Settings page in
+v0.13.0, along with the footer links. With no password set the homepage says
+the relay is open to anyone with the address and that there is no relay login
+to log out of; a **Log out** button then appears in Settings once a password
+is set.
 
-**IP widget:** under the address bar the homepage shows **you** — your real IP
-as Cloudflare sees it, with country and network — and **sites see** — the IP the
-relay fetches from, which is what the sites you visit see instead of yours —
-plus the Cloudflare data center serving you, with a **refresh** link. In the
-diagnostic panel the **IP** button shows the same two lines (it fetches only
-when you press it, and the result is never stored or copied). "Sites see" is
-measured from inside the Worker with an IP-echo service
-(`api64.ipify.org`, `icanhazip.com`, `checkip.amazonaws.com`) and cached for a
-minute; Cloudflare may use several outbound addresses, so it can vary from one
-check to the next, and a failed lookup shows "unavailable". Your own IP is
-never sent to the echo services — they only see the Worker's address. See the
-privacy notes under *Limitations*, and set `IP_WIDGET` to `false` to remove the
-widget and its `/__relay_ip` endpoint.
+**Settings** (`/settings`): one page for everything about the relay itself. It
+sits behind the password gate like everything else, and each change is a plain
+form post that redirects back with a short confirmation.
+
+- **Appearance** — **Light** and **Dark** buttons. Stored in this browser
+  (`localStorage`, the same key the homepage always used).
+- **Browsing mode** — which sites open in original mode (the default for every
+  site) and which in real-path mode; see below.
+- **Debug bar** — shows the state of debug mode and turns it on or off. On, the
+  small `relay` button is present on every page, with the failed-request log, a
+  **Link** button and a **Mode** button for the current site. It turns itself
+  off after 24 hours (the same cookie `/__relay_debug` sets).
+- **Your IP** — a **Check my IP** button; see below. The section is absent when
+  `IP_WIDGET` is `false`.
+- **Cookie jar** — the sites that have cookies in this browser, with the number
+  of cookies, a **Clear** button per site, **Clear all cookies**, and a link to
+  `/cookies` (the names-only list).
+- **Session** — **Log out**, present only when a password is set.
+
+**Browsing mode.** **Original** is the default for every site: the target is
+embedded in the path. **Real path** keeps the site's own address in the address
+bar (`/search?q=…` instead of `/https://github.com/search?q=…`) and is needed by
+sites that render nothing or crash in original mode — typically client-side apps
+whose router reads `location.pathname` (Poki renders a blank page in original
+mode; GitHub, BBC and react.dev misbehave). See *Real-path mode* below. You
+switch a site in Settings: type it in the field and press **Use real path**, or
+tap one of the suggestions (`poki.com`, `playhop.com`, `crazygames.com`,
+`github.com`, `bbc.com`, `bbc.co.uk`, `react.dev`), then reload the site. Each
+listed site has a **Use original** button that takes it back. The choice is
+remembered **per site, in this browser**: it is stored in one `__relay_rp`
+cookie on the relay's origin (bare hosts without `www.`, up to 40 sites, one
+year), so it survives a restart, does not depend on any storage in the Worker,
+and is forgotten if you clear all of the browser's cookies for the relay.
+**Clear all cookies** in Settings and **Sign out of sites** only touch the
+cookie jar, not this list. A site matches by exact host (with or without
+`www.`): `poki.com` does not cover `poki-gdn.com`, and that is deliberate — only
+a portal belongs in the list, never the host of a game it embeds (see *Real-path
+mode*). To switch a site you are looking at, turn the debug bar on once, tap
+`relay` and then **Mode**: it opens Settings with that site already filled in and
+a one-tap switch. Switching a site in either direction also clears the leftover
+real-path context cookie, so it cannot keep re-routing bare paths.
+
+**IP check.** Settings → **Your IP** shows nothing until you press **Check my
+IP**. The press fetches `/__relay_ip` once and shows **you** — your real IP as
+Cloudflare sees it, with country and network — **sites see** — the IP the relay
+fetches from, which is what the sites you visit see instead of yours — and the
+Cloudflare data center serving you. Nothing is remembered: every load starts
+with the lines hidden, the readings live only in the page's memory, and a failed
+fetch shows "unavailable" (press again to retry). In the diagnostic panel the
+**IP** button shows the same two lines (it fetches only when you press it, and
+the result is never stored or copied). "Sites see" is measured from inside the
+Worker with an IP-echo service (`api64.ipify.org`, `icanhazip.com`,
+`checkip.amazonaws.com`) and cached for a minute; Cloudflare may use several
+outbound addresses, so it can vary from one check to the next, and a failed
+lookup shows "unavailable". Your own IP is never sent to the echo services —
+they only see the Worker's address. See the privacy notes under *Limitations*,
+and set `IP_WIDGET` to `false` to remove the section, the panel's **IP** button
+and the `/__relay_ip` endpoint.
 
 **Logging in:** sites you sign into stay signed in — see *Cookie jar* below.
 Use a throwaway account to try it: your password passes through your Worker and
 Cloudflare on its way to the site, and nothing here is safe for an account you
-cannot afford to lose. `/cookies` lists the sites that have cookies in this
-browser, with the cookie **names** (never values), and clears one site or all of
-them; clearing signs you out of those sites. Login test sites are listed after
-the checklist.
+cannot afford to lose. The Settings page and `/cookies` list the sites that have
+cookies in this browser — `/cookies` shows the cookie **names** (never values)
+and clears one site or all of them; clearing signs you out of those sites. Login
+test sites are listed after the checklist.
 
 **Diagnostic panel:** on any proxied page, failures (non-2xx fetch/XHR,
 WebSocket errors, resources that failed to load) collapse into a small
 top-right button, `relay · N`. It never opens by itself: click to expand.
 Inside, the first line (`page: …`) shows the current page's real URL, **IP**
-shows your IP and the one sites see, **Link** copies a working relay link for
-the page, and **Copy** puts the failure list on the clipboard without DevTools.
-A failed request to a captcha provider is labelled as such. Cloudflare's own
-`/cdn-cgi/` requests and preload failures are filtered out so they don't inflate
-N. The panel exists on a page after its first failure, on real-path hosts, and
-from page load when debug mode is on.
+shows your IP and the one sites see (the button is removed when `IP_WIDGET` is
+`false`), **Mode** opens Settings for the current site (see *Browsing mode*),
+**Link** copies a working relay link for the page, and **Copy** puts the failure
+list on the clipboard without DevTools. A failed request to a captcha provider
+is labelled as such. Cloudflare's own `/cdn-cgi/` requests and preload failures
+are filtered out so they don't inflate N. The panel exists on a page after its
+first failure, on real-path sites, and from page load when the debug bar is on.
+On game sites it is not created after a failure at all (it would sit on top of
+the game), only when the debug bar is on.
 
-**Debug mode:** visit `https://relay.<username>.workers.dev/__relay_debug` to
-turn on verbose diagnostics for 24 hours (a cookie; `/__relay_debug?on=0` turns
-it off) — handy on a phone, where editing the worker for a flag isn't an
-option. It logs clicks with no `<a>` in their path (`RELAY_LOG_NO_LINK`, not
-failures — only useful when hunting for link-less navigation escapes), every
-`pushState`/`replaceState` call as original → proxied (`RELAY_LOG_NAV`) and,
-where the browser supports the Navigation API (Chromium), every navigation
-including `location.href = …` assignments and form submissions. The log is
-also kept in `sessionStorage`, so after a page jumps away (for example back to
-a site's home page) the panel on the next page still shows what happened before
-the jump. Failed `fetch`/XHR entries also include the first 200 characters of
-the response body, which is how bot-protection responses explain themselves.
-Open the panel and use Copy to paste it back.
+**Debug mode:** turn it on in Settings → **Debug bar**, or visit
+`https://relay.<username>.workers.dev/__relay_debug` (`?on=0` turns it off), for
+verbose diagnostics for 24 hours (a cookie) — handy on a phone, where editing the
+worker for a flag isn't an option. It logs clicks with no `<a>` in their path
+(`RELAY_LOG_NO_LINK`, not failures — only useful when hunting for link-less
+navigation escapes), every `pushState`/`replaceState` call as original →
+proxied (`RELAY_LOG_NAV`) and, where the browser supports the Navigation API
+(Chromium), every navigation including `location.href = …` assignments and form
+submissions. The log is also kept in `sessionStorage`, so after a page jumps
+away (for example back to a site's home page) the panel on the next page still
+shows what happened before the jump. Failed `fetch`/XHR entries also include the
+first 200 characters of the response body, which is how bot-protection responses
+explain themselves. Open the panel and use Copy to paste it back.
 
-**Real-path hosts (experimental):** on a few hosts the address bar shows a
-bare real path (`/search?q=…`) instead of the embedded form
-(`/https://github.com/search?q=…`) — see *Real-path mode* below. On those
-pages the `relay` button is present from load, and **Link** is how you get a
-shareable URL.
+**Mobile:** the relay's own pages work on a phone: buttons and inputs get
+roughly 44-pixel touch targets, inputs are at least 16 px so iOS Safari does
+not zoom the page when you focus them, the diagnostic panel is capped to the
+viewport and respects the notch (`env(safe-area-inset-*)`), long log lines wrap
+instead of stretching the page sideways, and on narrow screens the homepage and
+Settings lay out in a single column. This covers the relay's own UI only —
+proxied sites are passed through untouched, so their own mobile behaviour is
+their own.
+
+**Paths the relay answers itself:**
+
+| Path | Purpose |
+|---|---|
+| `/` | Homepage. |
+| `/settings` | Settings page and its form posts. `?site=<host>` opens it with that site filled in (the panel's **Mode** button); `?note=` carries the confirmation after a change. |
+| `/cookies` | Cookie manager (names only); POST clears one site or all. |
+| `/login`, `/logout` | Password gate (only with `PASSWORD`). |
+| `/__relay_ip` | IP lookup JSON (GET/HEAD), behind the password gate. |
+| `/__relay_debug` | Turns debug mode on (`?on=0` off) for 24 hours. |
+| `/__relay_inject.js?v=<hash>` | The injected client script, cached for a year. |
+| `/__proxy_sw.js` | The relay's Service Worker. |
+| `/favicon.ico`, `/robots.txt` | Answered at the root so they never enter target recovery. |
+
+A proxied site's own link to one of these names that escaped to the relay's
+origin (its `/settings`, `/login`, `/cookies`) is repaired from the `Referer`
+instead, except where the request carries `?site=` / `?note=` on `/settings` or
+`?redirect=` / `?error=` on `/login`.
 
 ---
 
@@ -162,7 +236,34 @@ CSS `url()`) works inside files the relay never parses.
   `srcset`, `<meta http-equiv="refresh">` and forms, in `text/html` and XHTML
   documents alike. Empty `src`/`href` values are left alone (an empty `src`
   must not resolve to the page itself). A forced permissive referrer policy
-  keeps the recovery below working on sites that restrict it.
+  keeps the recovery below working on sites that restrict it. A
+  `<meta http-equiv="Content-Security-Policy">` (and the report-only variant) is
+  removed: it is evaluated against the relay's origin, where its host lists
+  block the proxied copies of the site's own scripts and requests — the same
+  reason the CSP *header* is dropped (below).
+- **Stability fallbacks.** An unexpected error no longer takes the response
+  down with it: if the rewriter's handler throws on a single element, that
+  element is passed through unrewritten and the stream continues, and if
+  anything else fails after the upstream response has already arrived, the
+  relay answers with the original body and only the headers corrected. None of
+  this changes how any site is rewritten — the fallbacks cover only what
+  happens when something unexpectedly throws. A `204`, `205` or `304` response
+  that advertises `text/html` is passed through as it is instead of being run
+  through the rewriter (a null-body status cannot carry a body, and wrapping one
+  used to end in the relay's 500 page).
+- **Upstream response headers that would act on the relay's origin are
+  stripped** from every passthrough: `Strict-Transport-Security` (a target's
+  `includeSubDomains` could pin the relay's whole parent domain),
+  `Clear-Site-Data` (could wipe the relay's cookie jar and storage),
+  `Content-Security-Policy` and its report-only variant and `X-Frame-Options`
+  (written for the real site; on a script, worker or framed document served from
+  the relay they only break it), `Link` (carries raw preload URLs that bypass the
+  relay), `Report-To`, `Reporting-Endpoints`, `NEL`, `Alt-Svc`, `Expect-CT`,
+  `Public-Key-Pins` and, as before, `Referrer-Policy` (it strips the `Referer`
+  from a file's own subrequests, which the recovery below depends on) and
+  `Set-Cookie`. The response is re-wrapped only when one of them is present. The
+  final URL after redirects is read **before** any re-wrap, because a re-wrapped
+  `Response` has an empty `.url`.
 - **Forms.** A POST form's `action` (and any `formaction`) is rewritten to the
   proxied URL, so the submission goes through the relay with its cookies; a
   form with no `action` posts to the page's own, already proxied, URL. GET
@@ -199,28 +300,42 @@ CSS `url()`) works inside files the relay never parses.
   string (a consent manager's `href=<relay>/https://…`, or `href=<relay>/news`
   on a real-path page) are restored to the real URL. The browser's own cookies
   are never forwarded as-is: the target gets only the cookies from the jar
-  below. The visitor's IP is never forwarded (`CF-Connecting-IP`,
-  `X-Forwarded-For` and friends are dropped).
-- Timeout, one retry for bodyless requests, `Retry-After`-aware backoff on
-  429/503, and a styled error page for Cloudflare edge failures.
+  below. **The visitor's IP is never forwarded**: `CF-Connecting-IP`,
+  `X-Forwarded-For`, `True-Client-IP`, `X-Real-IP`, `Forwarded`, `Via`,
+  `CDN-Loop` and the `cf-` geo headers (city, region, postal code, timezone,
+  latitude, longitude and so on) are all dropped.
+- A target that is the relay itself is refused, compared by host as well as
+  origin, so `http://<relay>` cannot slip past a check made on the `https`
+  origin; the WebSocket bridge applies the same check.
+- Timeout (a stalled target is reported as "did not answer within N seconds" and
+  is **not** retried), one retry after a network failure and a capped
+  `Retry-After`-aware retry on 429/503 — **both only for `GET`/`HEAD` without a
+  body**, so a bodyless `POST` is never sent twice — and a styled error page for
+  Cloudflare edge failures.
 - Caching: edge cache for static assets (GET only), keyed partly on the
   request's `Accept` header with per-status TTLs (`cacheTtlByStatus`);
-  Cloudflare's fetch cache; long browser caching for static types. Only
-  anonymous responses are cached: a request that carries jar cookies bypasses
-  every cache, a response that sets cookies is never stored, HTML is never
-  stored in the edge cache while the jar is on (a login page carries a CSRF
-  token), and Cloudflare's fetch cache is limited to static assets. Large
-  assets (>20 MB) skip the edge-cache copy. Range requests and HLS/DASH
-  manifests (`.m3u8`, `.mpd`) bypass the blanket edge cache — a cached live
-  playlist stalls playback.
+  Cloudflare's fetch cache; long browser caching for static types (scripts,
+  styles, images, fonts, `application/wasm`). Only anonymous responses are
+  cached: a request that carries jar cookies bypasses every cache, a response
+  that sets cookies is never stored, HTML is never stored in the edge cache
+  while the jar is on (a login page carries a CSRF token), and Cloudflare's fetch
+  cache is limited to static assets (and game assets, below). Large assets
+  (>20 MB) skip the edge-cache copy. **Range requests** and HLS/DASH manifests
+  (`.m3u8`, `.mpd`) bypass every cache — lookup and store — because the cache
+  key ignores `Range`: a cached full body must never answer a Range request, and
+  a cached live playlist stalls playback. A throwing cache lookup counts as a
+  miss, never a failed request.
 - WebSockets are bridged browser to Worker to target, including subprotocol
   negotiation, the real `Origin` and the target's cookies. (A WebSocket
   handshake carries no `Referer`, so derived hostnames are not translated for
-  sockets.)
+  sockets.) A Worker's `close()` accepts only 1000 and 3000–4999, so a peer
+  closing with 1005, 1006, 1011 and similar is mapped (1001, 1005 or no code to
+  1000, anything else to 4011) and the reason is cut short; an error or close on
+  either side closes the other, so the two halves can no longer be left open.
 - The relay answers `/favicon.ico` and `/robots.txt` at its own root, so
   those bare-origin requests never enter the target-recovery path. A target's
   own `/cdn-cgi/rum` and `/cdn-cgi/speculation` get a 204.
-- **IP widget endpoint.** `/__relay_ip` (GET/HEAD, behind the password gate,
+- **IP check endpoint.** `/__relay_ip` (GET/HEAD, behind the password gate,
   before the escape-recovery logic) returns `{ you: { ip, country, city, region,
   asn, org }, relay: { ip, source } | null, colo }` with `Cache-Control:
   no-store`. `you` comes from `CF-Connecting-IP` and Cloudflare's request
@@ -233,21 +348,68 @@ CSS `url()`) works inside files the relay never parses.
   payload). Image hosts inside those payloads (`REWRITE_SKIP_HOSTS`) are left
   alone — pre-wrapping them breaks DDG's own image proxy.
 
-**Speed.** The injected script is built and minified once per Worker instance
-(full-line comments and indentation stripped: about 61 KB → 31 KB added to every
-page) and only the real path is substituted per request. The relay's Service
-Worker registers a static route (Chromium's `addRoutes`) so requests whose path
-already starts with an embedded URL skip the worker instead of waking it for
-every subresource. Documents and API calls skip the edge-cache lookup (HTML is
-never stored there); the cache key is built from the URL alone. The password
-hash is computed once per instance; the cookie jar decodes only the cookies that
-can apply to the requested host; the query-string check exits immediately when
-the query does not mention the relay; link rewriting parses the page's base URL
-once. In the browser, the `MutationObserver` skips nodes covered by an ancestor
-added in the same batch and the diagnostic stale-link sweep waits for idle time.
-Optional, off by default: `BLOCKED_HOSTS` answers analytics and ad hosts with an
-empty 204 instead of fetching them (each is a full Worker round trip) — blocking
-can break pages that expect those scripts, so it is a switch, not a default.
+**Gaming sites.** Game portals (Poki, PlayHop, CrazyGames, GameDistribution,
+GameMonetize, Y8, itch.io, Kongregate, Newgrounds, Miniclip, Armor Games,
+Addicting Games and the Yandex games hosts) put each game in a cross-origin
+iframe, load large wasm and data bundles with `fetch()`/XHR, and talk to ad SDKs
+and to the portal through `postMessage` — none of which the generic rules were
+tuned for. `GAME_MODE` (on by default) adds, in **game context** — a request
+whose target host or whose page (from the `Referer`) is in `GAME_HOSTS`:
+
+- **Game assets** (`.wasm`, `.unityweb`, `.data`, `.bundle`, `.pck`, `.mem`,
+  `.glb`, `.gltf`, `.ktx2`, `.basis`, `.atlas`, `.skel`, `.fnt`, audio, `.br`,
+  `.gz`; `GAME_ASSET_PATH`) are cached at Cloudflare's fetch layer and in the
+  relay's edge cache even though they are fetched with destination `empty`
+  (which the jar-on rules otherwise exclude), and get the 24 h browser cache
+  when upstream gives no freshness policy of its own.
+- `.wasm` is served as `application/wasm` when upstream sends another type, so
+  `WebAssembly.instantiateStreaming` works.
+- The debug button is not created after a failed request (see *Diagnostic
+  panel*).
+- **Ad and analytics refusal** (`GAME_BLOCK_ADS`, **off** by default): requests to
+  `GAME_AD_HOSTS` get an empty `403`, which is how a browser ad-blocker looks to
+  an SDK (the script's error event fires), so the SDK takes its "no ads" path
+  instead of waiting on an ad request. It is off because how each game reacts is
+  not predictable; turn it on if ad requests stall a game.
+
+A portal built as a client-side app (Poki, PlayHop, CrazyGames) also needs
+real-path mode for the **portal**, in Settings; the game's own host
+(`poki-gdn.com` and similar) must stay in original mode. Add a portal to
+`GAME_HOSTS` and a pattern to `GAME_ASSET_PATH` / `GAME_AD_HOSTS` at the top of
+`_worker.js`; nothing else needs to change.
+
+**Speed.** The injected client script is **not** inlined in every page any more
+(v0.13.0): it is built and minified once per Worker instance (full-line comments
+and indentation stripped: about 61 KB → 39 KB with the v0.13.0 additions) and
+served from `/__relay_inject.js?v=<hash>` with `Cache-Control: public,
+max-age=31536000, immutable` and an `ETag`. The version is the SHA-256 prefix of
+the script text, so a deploy that changes the script changes the URL. Each HTML
+page carries only a one-line config script (`window.__relayCfg`: the real path
+for real-path mode and the game-context flag) and a `<script src>`; if the
+config script is ever blocked, the file falls back to normal mode. As a side
+effect the script also loads on pages whose CSP forbids inline scripts. The
+route is answered before the escape-recovery logic, sits behind the password
+gate, and is in the Service Worker's own-path list. The relay's Service Worker
+registers a static route (Chromium's `addRoutes`) so requests whose path already
+starts with an embedded URL — including the collapsed `/https:/host/…` form a
+client-side router can produce — and the relay's own paths skip the Service
+Worker instead of waking it for every subresource. Requests for static asset
+types, matched by extension (`.js`, `.css`, images, fonts, media), take a fast
+path that skips the page-context probe, the escape-recovery logic and the
+rewriter decision tree entirely; jar cookies are still applied. HTML goes
+through a single `HTMLRewriter` chain — one traversal of the document. Documents
+and API calls skip the edge-cache lookup (HTML is never stored there); the cache
+key is built from the URL alone. The password hash is computed once per
+instance; the cookie jar decodes only the cookies that can apply to the
+requested host; the query-string check exits immediately when the query does not
+mention the relay; link rewriting parses the page's base URL once. In the
+browser, the diagnostic panel and the IP lines are built lazily — after load, or
+on first use — instead of during injection; the `MutationObserver` skips nodes
+covered by an ancestor added in the same batch and the diagnostic stale-link
+sweep waits for idle time. Optional, off by default: `BLOCKED_HOSTS` answers
+analytics and ad hosts with an empty 204 instead of fetching them (each is a
+full Worker round trip) — blocking can break pages that expect those scripts, so
+it is a switch, not a default.
 
 **Cookie jar.** The Worker has no storage, so each visitor's browser keeps its
 own jar, as cookies on the relay's origin — **one relay cookie per upstream
@@ -265,10 +427,12 @@ prefixes, and `SameSite` judged against the page's site) into an ordinary
 `Cookie` header, and turns each upstream `Set-Cookie` into one relay
 `Set-Cookie` (set or expire). Limits: about 3.8 KB per cookie, 6 KB per site
 and 10 KB in total; past that the largest untouched sites are expired so the
-browser's `Cookie` header can never grow past what Cloudflare accepts. To turn
-the jar off, set `COOKIE_JAR` to `false` at the top of `_worker.js` (redirects
-and caching then behave as in v0.10.0; POST forms still go through the relay,
-without cookies).
+browser's `Cookie` header can never grow past what Cloudflare accepts. The
+relay's own cookies live beside the jar and are not part of it: `__relay_pwd`
+(login), `__relay_rp` (the real-path site list), `__relay_ctx` (real-path
+context) and `__relay_debug`. To turn the jar off, set `COOKIE_JAR` to `false` at
+the top of `_worker.js` (redirects and caching then behave as in v0.10.0; POST
+forms still go through the relay, without cookies).
 
 **Captchas and embedded widgets.** A captcha checks which site is hosting it:
 its widget URL carries that site's name (hCaptcha: `host=` in the fragment or
@@ -291,84 +455,94 @@ decision — see *Limitations*.
 
 **Client side (injected script).** Patches `fetch` (string, `URL` and
 `Request` inputs; `Request` bodies are buffered rather than re-streamed), XHR,
-`EventSource`, `window.open`, `WebSocket`, `postMessage` (on the window
-instance and on iframe windows as they are first touched),
-`pushState`/`replaceState` and `form.submit()`; replaces `document.cookie`
-with a shim over the cookie jar; reports real origins on `MessageEvent.origin`;
-repairs captcha widget URLs; hooks `setAttribute`/`getAttribute` and the
-`href`/`src`/`action` properties so URLs written by JS frameworks are proxied
-at assignment and read back unmodified (this stops React reverting the
-rewrite); points the `action` of forms that POST — including ones inserted by
-JavaScript — through the relay; intercepts clicks and middle-clicks in the
-capture phase; blocks the target site's own Service Worker registration. A
-`MutationObserver` covers `innerHTML`-inserted content. Each risky patch is
-wrapped in its own `try`/`catch` so one failing patch cannot silently disable
-the rest.
+`EventSource`, `window.open`, `WebSocket`, `Worker` and `SharedWorker` (their
+script URLs; `blob:` and `data:` pass through), `navigator.sendBeacon` (beacons
+used to go from the browser straight to third parties, around the relay),
+`postMessage` (on the window instance and on iframe windows as they are first
+touched), `pushState`/`replaceState` and `form.submit()`; replaces
+`document.cookie` with a shim over the cookie jar; shows the real referring URL
+in `document.referrer` instead of `<relay>/https://real.site/…` (game SDKs and
+embeds check it); reports real origins on `MessageEvent.origin`; repairs captcha
+widget URLs; hooks `setAttribute`/`getAttribute` and the `href`/`src`/`action`
+properties so URLs written by JS frameworks are proxied at assignment and read
+back unmodified (this stops React reverting the rewrite); points the `action` of
+forms that POST — including ones inserted by JavaScript — through the relay;
+intercepts clicks and middle-clicks in the capture phase; blocks the target
+site's own Service Worker registration. A `MutationObserver` covers
+`innerHTML`-inserted content. Every patch is feature-tested before it is
+installed — an API the browser does not provide is skipped rather than patched
+blindly — and each risky patch is wrapped in its own `try`/`catch` so one failing
+patch cannot silently disable the rest.
 
-**Real-path mode (experimental).** Sites whose client-side router reads
-`location.pathname` (Next.js, React Router, GitHub's React apps) cannot work
-under a path-embedded scheme: they see `/https://host/page` instead of
-`/page`, fail to match their routes, and crash, hard-navigate to a collapsed
-path, or leave widgets inert. For hosts matched by `REAL_PATH_HOSTS` — today
-`bbc.com`, `bbc.co.uk`, `github.com` and `react.dev`, each with or without
-`www.`, **exact hostnames only** (`gist.github.com` is not included) — the
-injected script rewrites the address bar to the real path right after load.
-Loading is unaffected, because relative URLs resolve through the injected
-`<base>`, not the address bar. History calls keep real paths in the bar, and a
-one-day `__relay_ctx` cookie (set client-side, never forwarded upstream)
-remembers the real origin so a reload of the bare path — and bare requests
-whose `Referer` can't place them — are routed back to the right site. Every
-other host keeps the full embedded address.
+**Real-path mode.** Sites whose client-side router reads `location.pathname`
+(Next.js, React Router, GitHub's React apps, Poki) cannot work under a
+path-embedded scheme: they see `/https://host/page` instead of `/page`, fail to
+match their routes, and render nothing, crash, hard-navigate to a collapsed
+path, or leave widgets inert. For a site switched to real-path mode in Settings
+(see *Browsing mode*) the injected script rewrites the address bar to the real
+path right after load. Loading is unaffected, because relative URLs resolve
+through the injected `<base>`, not the address bar. History calls keep real
+paths in the bar, and a one-day `__relay_ctx` cookie (set client-side, never
+forwarded upstream) remembers the real origin so a reload of the bare path — and
+bare requests whose `Referer` can't place them — are routed back to the right
+site. The Worker decides per page: the final host of the response (after
+redirects) is looked up in the `__relay_rp` list, and the real path is handed to
+the injected script through its config script. Every site not in the list keeps
+the full embedded address. **Only the portal belongs in the list:** the context
+cookie holds a single real origin shared by every frame, so a game's own host
+(`poki-gdn.com`) in real-path mode would overwrite the portal's.
 
-To change which hosts use it, edit the single constant near the top of
-`_worker.js`:
+Two constants near the top of `_worker.js` belong to it:
 
 ```js
-const REAL_PATH_HOSTS = /^(www\.)?(bbc\.com|bbc\.co\.uk|github\.com|react\.dev)$/i;
+const MODE_COOKIE = '__relay_rp';
+const SUGGESTED_REAL_PATH = ['poki.com', 'playhop.com', 'crazygames.com', 'github.com', 'bbc.com', 'bbc.co.uk', 'react.dev'];
 ```
 
-Set it to `/^$/` to disable the mode everywhere. Add a host only when it shows
-the same symptoms (a client-side crash or dead widgets, with
-`location.pathname` visible in the error); sites that already work should not
-be added.
+`SUGGESTED_REAL_PATH` only fills the one-tap buttons in Settings; nothing is
+switched automatically. Suggest a site only when it shows the same symptoms (a
+blank page, a client-side crash or dead widgets, with `location.pathname`
+visible in the error); sites that already work should not be added. Before
+v0.13.0 a hard-coded `REAL_PATH_HOSTS` list switched `bbc.com`, `bbc.co.uk`,
+`github.com` and `react.dev` automatically; those now open in original mode
+until switched.
 
 ---
 
 ## Editing and verifying `_worker.js`
 
 The injected script is a string inside a template literal (in
-`ScriptInjector.scriptText()`), so **`node --check _worker.js` does not validate
-it.** A syntax error there stops the whole script in the browser while the outer
-file still checks clean — this has happened twice: a stray brace (caught
-pre-deploy) and the template-escaping bug that shipped from v0.5.0 to
-v0.9.0. The injected script contains `${…}` placeholders, so check the text
-the browser actually receives — evaluate the template, don't grep the source.
-Run all three checks:
+`buildInjectedScript()`), so **`node --check _worker.js` does not validate it.**
+A syntax error there stops the whole script in the browser while the outer file
+still checks clean — this has happened twice: a stray brace (caught pre-deploy)
+and the template-escaping bug that shipped from v0.5.0 to v0.9.0. The injected
+script contains `${…}` placeholders, so check the text the browser actually
+receives — evaluate the template, don't grep the source. Since v0.13.0
+`buildInjectedScript()` returns plain JavaScript (no `<script>` tags) and
+`getInjected()` minifies it and computes the version. Run all three checks:
 
 ```
 node --check _worker.js
 
 node --input-type=module - << 'JS'
 import fs from 'fs';
-const src = fs.readFileSync('_worker.js', 'utf8')
-  .replace('export default {', 'const __worker = {') +
-  '\nglobalThis.__SI = ScriptInjector; globalThis.__SW = SW_SCRIPT;';
-fs.writeFileSync('/tmp/_w.mjs', src);
-await import('/tmp/_w.mjs');
-let out = '';
-new globalThis.__SI('https://relay.test', '/x', true).element({ prepend: (s) => { out = s; } });
-fs.writeFileSync('inj.js', out.replace(/^\s*<script>/, '').replace(/<\/script>\s*$/, ''));
-fs.writeFileSync('sw.js', globalThis.__SW);
+fs.writeFileSync('/tmp/_w.mjs', fs.readFileSync('_worker.js', 'utf8') + '\nexport { getInjected, SW_SCRIPT, settingsPage };\n');
+const m = await import('/tmp/_w.mjs');
+const inj = await m.getInjected('https://relay.test', true);
+fs.writeFileSync('inj.js', inj.text);
+fs.writeFileSync('sw.js', m.SW_SCRIPT);
 JS
 node --check inj.js
 node --check sw.js
 ```
 
-`inj.js` is the client script exactly as the browser gets it (minified; real-path
-mode on and cookie jar on — the constructor's arguments are the relay origin,
-the real path and the jar flag; pass `''` and `false` to check the normal,
-jar-off variants), `sw.js` the relay's Service Worker script. The Service Worker
-script is also a template literal and has the same backslash rule.
+`inj.js` is the client script exactly as the browser gets it from
+`/__relay_inject.js` (minified; the arguments are the relay origin and the jar
+flag — pass `false` to check the jar-off variant), `sw.js` the relay's Service
+Worker script. The Service Worker script is also a template literal and has the
+same backslash rule. The per-page settings (real path, game flag) are no longer
+arguments: they arrive as `window.__relayCfg` from the inline config script that
+`ScriptInjector` writes in front of the file.
 
 **Backslash rule:** a backslash inside the injected script (and the Service
 Worker script) must be written **doubled** in the source. The template
@@ -380,7 +554,9 @@ but means something else — a missing `\\/` once turned "path starts with
 `/https://`" into "starts with `/https:/`" and passed every syntax check. For
 URL and cookie logic, run the function on sample inputs
 (`toProxied('/https:/react.dev/')` and friends) or the checks below, not just
-`--check`.
+`--check`. The Settings page and the homepage are ordinary template literals in
+the Worker: regexes in their inline scripts need the same doubling, which is why
+the Settings script avoids regexes altogether.
 
 **Template rule:** avoid backticks and `${` inside the injected script's
 comments and code: they end or interpolate the template literal itself.
@@ -403,7 +579,9 @@ read the page's real cookie string with `relayRawCookie()` /
 relay's own cookies. To call the relay itself from the injected script (the
 panel's IP button does), use the native fetch (`origFetch`) with an absolute
 relay URL: the patched `fetch` would rewrite a relay path into the proxied
-site's.
+site's. The panel's **Mode** button navigates to `/settings?site=<host>`; keep
+the `site=` parameter, because the server uses it to tell that request apart
+from a proxied site's own `/settings` link.
 
 The jar's cookie-name scheme, record format and base64url codec exist twice —
 the Worker's `jarCookieName`/`loadJar`/`storeSetCookies` and the injected
@@ -417,13 +595,22 @@ login page (CSRF cookie), POST the form (302 with `Set-Cookie`), follow the
 redirect with the stored cookies, and check that parallel responses setting
 different cookies all survive.
 
+Settings routes can be exercised without Cloudflare: Node's `Request` and
+`Response` are enough to call the exported `fetch` handler for `/settings` (it
+answers before anything that needs the Cache API). `GET /settings` returns the
+page; `POST /settings` with `action=mode_real&site=poki.com` answers a 302 to
+`/settings?note=real` with a `__relay_rp` `Set-Cookie`, and a following GET
+carrying that cookie lists the site; `action=mode_original` removes it;
+`GET /settings?site=…` with a proxied-page `Referer` must still return the page,
+while a bare `GET /settings` with a proxied-page `Referer` must be redirected into
+the target.
+
 ---
 
 ## Quick test checklist
 
-1. Homepage loads; footer shows `build v0.11.0 · path-embedded`; the header has
-   **Cookies** and **Sign out of sites** (and **Log out** when a password is set;
-   with no password the page says so).
+1. Homepage loads; footer shows `build v0.13.0 · path-embedded`; the header has
+   a single **Settings** button (with no password the page says so).
 2. `/https://example.com`: page renders, link clicks stay on the relay.
 3. DuckDuckGo search: result links show the relay prefix on hover and stay on
    the relay when clicked; switching All / Images / Videos / News keeps
@@ -431,56 +618,81 @@ different cookies all survive.
 4. `https://echo.websocket.org/.ws`: connects and echoes (WebSocket bridge).
 5. With `PASSWORD` set: any URL redirects to `/login`; a wrong password
    returns to the form with an error and no resubmit prompt; a correct one
-   lands on the original destination; `/logout` ends the session; the homepage
-   shows a **Log out** button in the header and a footer link; `/__relay_login`
-   and `/__relay_logout` redirect to the new URLs.
+   lands on the original destination; `/logout` ends the session; Settings shows
+   a **Log out** button; `/__relay_login` and `/__relay_logout` redirect to the
+   new URLs; `/settings` redirects to `/login` when signed out.
 6. Deliberately bad input (`/https://gitbub.com`) shows a styled error page,
    not Cloudflare's.
 7. Panel smoke test (proves the injected script is alive): open a proxied
    page with at least one broken subresource — the top-right shows
    `relay · N`, it stays collapsed until clicked, and clicking inside it
    doesn't navigate. Copy produces the failure list. View the page source: the
-   injected `<script>` has no comment lines or indentation.
-8. Real-path hosts: `/https://react.dev` stays on the page (no redirect to a
-   broken `https:/react.dev`) and shows `/` in the address bar; a GitHub repo
-   opens its search-filter and "…" menus, and a GitHub search shows the real
-   URL in the panel's `page:` row; `/https://www.bbc.com/news` renders without
-   the "client-side exception" screen. Reload on a non-root real-path page
-   lands back on the same site. A host outside the list (for example
-   `gist.github.com`) keeps its embedded address.
-9. With `COOKIE_JAR` set to `false`: `/https://bbc.com/news` ends on
-   `www.bbc.com` with the address bar matching the final URL (redirect-follow
-   check).
-10. `/__relay_debug` shows "Relay debug mode: ON"; on any proxied page the
-    `relay` button is then present from load, and it keeps entries from the
-    previous page after a navigation. `/__relay_debug?on=0` turns it off.
+   head starts with a one-line `window.__relayCfg=…` script and a
+   `<script src=".../__relay_inject.js?v=…">`, and opening that URL returns the
+   script (no comment lines or indentation) with `Cache-Control: public,
+   max-age=31536000, immutable`; a second request with `If-None-Match` answers 304.
+8. Settings page: **Light** and **Dark** switch the theme and it persists after
+   a reload; **Check my IP** shows lines only after the press; **Turn on** under
+   Debug bar makes the `relay` button appear on a proxied page, **Turn off**
+   removes it; the cookie list matches `/cookies`; **Clear** and **Clear all
+   cookies** sign you out of the sites involved.
+9. Per-site mode: with nothing switched, `/https://react.dev` and
+   `/https://github.com` show the embedded address. In Settings add `react.dev`
+   (or tap its suggestion): after a reload `/https://react.dev` stays on the page
+   (no redirect to a broken `https:/react.dev`) and shows `/` in the address
+   bar; a GitHub repo opens its search-filter and "…" menus once `github.com` is
+   switched, and the panel's `page:` row shows the real URL;
+   `/https://www.bbc.com/news` renders without the "client-side exception"
+   screen once `bbc.com` is switched. Reload on a non-root real-path page lands
+   back on the same site. The choice survives closing the browser; **Use
+   original** takes the site back to the embedded address; a site not in the list
+   (`gist.github.com`) keeps its embedded address. **Mode** in the panel opens
+   Settings with the current site filled in.
+10. Debug bar: Settings → **Turn on** (or `/__relay_debug`) shows "ON"; on any
+    proxied page the `relay` button is then present from load, and it keeps
+    entries from the previous page after a navigation. Turning it off (or
+    `/__relay_debug?on=0`) removes it.
 11. Cookie plumbing, `httpbin.org` (or `httpbingo.org`): `/cookies/set?a=1&b=2`
     redirects to `/cookies` and shows both cookies; the relay's `/cookies`
     page then lists `httpbin.org` with `a` and `b`; `/cookies/delete?a` leaves
     only `b`; `/forms/post` submits a POST form and echoes it back;
     `/redirect/3` ends on the final page with the address bar correct;
     `/basic-auth/user/passwd` (user `user`, password `passwd`) authenticates.
-12. A proxied site's own `/login` link (for example one on GitHub or BBC) takes
-    you to that site's login page, not the relay's, whether or not a password
-    is set — both as a link and as a form post.
+12. A proxied site's own `/login` or `/settings` link (for example one on GitHub
+    or BBC) takes you to that site's page, not the relay's, whether or not a
+    password is set — both as a link and as a form post.
 13. A real login (see below): after logging in you stay signed in across a
     reload and across clicks to other pages; the site's cookie names appear on
-    `/cookies`; the browser's own cookie view shows only `__rj_…` cookies on
-    the relay's origin, not the site's own cookie names; logging out signs you
-    out; **Clear** on `/cookies` signs you out; **Sign out of sites** on the
-    homepage signs you out of every site.
+    `/cookies`; the browser's own cookie view shows only `__rj_…` cookies (plus
+    the relay's own `__relay_…`) on the relay's origin, not the site's own cookie
+    names; logging out signs you out; **Clear** signs you out; **Clear all
+    cookies** in Settings signs you out of every site.
 14. Derived hostnames: a page that builds API names from its hostname (Proton's
     sign-up page) loads its human-verification step without a 502 for
     `relay-api.<your domain>`; in the panel (or debug log) the request went to
     the page's real API host. A captcha widget may still refuse — that is the
     provider's decision, not the relay's.
-15. IP widget: the homepage shows your IP under **you** and a different IP
-    under **sites see** (compare with what an IP-check site such as
-    `httpbin.org/ip` reports when opened through the relay — that one is what a
-    site really sees, and should match **sites see** or be another address from
-    the same Cloudflare range); **refresh** re-checks; in a proxied page's panel
-    the **IP** button shows the same two lines and the lines disappear from
-    **Copy**.
+15. IP check: Settings shows no IP lines until you press **Check my IP**; the
+    press fetches them once (your IP under **you**, a different one under **sites
+    see** — compare with what an IP-check site such as `httpbin.org/ip` reports
+    when opened through the relay — that one is what a site really sees, and
+    should match **sites see** or be another address from the same Cloudflare
+    range); a reload starts hidden again and nothing requests `/__relay_ip` until
+    you press the button. With `/__relay_ip` blocked in DevTools request
+    blocking, the press shows "unavailable" and the next press retries. In a
+    proxied page's panel the **IP** button shows the same two lines and the lines
+    disappear from **Copy**.
+16. Gaming: `/https://poki.com` is blank until `poki.com` is switched to real path
+    in Settings; after that the portal renders, a game opens in its iframe and
+    stays in original mode (`poki-gdn.com` is not in the list), and the `relay`
+    button does not cover the game. Game assets (`.wasm`, `.data`) load with
+    `Content-Type: application/wasm` for wasm and, on a repeat visit, come from
+    cache. If ads stall a game, set `GAME_BLOCK_ADS` to `true` and retry.
+17. Headers: through the relay, a target that sends `Strict-Transport-Security`,
+    `Content-Security-Policy` or `X-Frame-Options` (for example
+    `https://example.com` or `https://github.com`) does not return them — check
+    the response headers in DevTools; a Range request (a video seek) is answered
+    with `206` from upstream, not a cached full body.
 
 ### Login test sites
 
@@ -500,7 +712,7 @@ change.
   `admin123`; a single-page app with a CSRF token and an XHR login).
 - **Real services, throwaway account:** `news.ycombinator.com/login`,
   Wikipedia (cookies scoped to `.wikipedia.org`), `github.com` (a real-path
-  host with `__Host-` and `SameSite=Strict` cookies; use an account without
+  site with `__Host-` and `SameSite=Strict` cookies; use an account without
   2FA and expect a new-device verification), `meta.discourse.org` (a
   single-page app that logs in over fetch), a Mastodon instance.
 - **Expected not to work, or only partly:** Google, Microsoft, Facebook and
@@ -534,15 +746,21 @@ change.
   headers, so sites you fetch through it see the relay's outbound address, not
   yours — but Cloudflare, and whoever runs the Worker, see it. It is not hidden
   from WebRTC (a page can discover your address through a peer connection, which
-  the relay does not intercept), and the IP widget adds one more way to read it:
-  every proxied page shares the relay's origin, so a script written to attack the
-  relay could fetch `/__relay_ip`. The panel button is guarded (it fetches only
-  on a real click, never stores the result, and keeps it out of Copy) and the
-  homepage HTML never embeds an IP, but that is mitigation, not isolation; real
-  isolation needs each site on its own origin (see the roadmap in the project
-  notes). "Sites see" is a spot check from an outside echo service: Cloudflare
-  may use several outbound addresses, sites on Cloudflare itself see further
-  Cloudflare-specific signals, and the lookup can fail ("unavailable").
+  the relay does not intercept), and the IP endpoint adds one more way to read
+  it: every proxied page shares the relay's origin, so a script written to attack
+  the relay could fetch `/__relay_ip` — setting `IP_WIDGET` to `false` removes
+  the endpoint and closes that particular route, though the shared origin itself
+  remains. The homepage HTML never embeds an IP, Settings shows none until you
+  press **Check my IP**, and the panel button is guarded the same way (it
+  fetches only on a real click, never stores the result, and keeps it out of
+  Copy). That is mitigation, not isolation; real isolation needs each site on
+  its own origin (see the roadmap in the project notes). "Sites see" is a spot
+  check from an outside echo service: Cloudflare may use several outbound
+  addresses, sites on Cloudflare itself see further Cloudflare-specific signals,
+  and the lookup can fail ("unavailable"). Beacons are routed through the relay
+  since v0.13.0, but any other way a page can reach a third party directly (a
+  WebRTC connection, an image or CSS `url()` written as an absolute URL in an
+  inline style) still shows your own address.
 - **Cookie jar limits.** Cookies are stored in the visitor's browser on the
   relay's origin, so every proxied site shares that origin: a page's script can
   read the *script-visible* (non-HttpOnly) cookies of other proxied sites by
@@ -566,15 +784,27 @@ change.
   connection can drop. A keepalive was deliberately not added: it would inject
   unexpected messages into the real application protocol.
 - **All proxied sites share the relay origin**, so their
-  `localStorage`/`sessionStorage` can collide. Per-target storage isolation
-  is deliberately deferred.
-- **Real-path mode trade-offs.** The address bar on those hosts carries no
+  `localStorage`/`sessionStorage` and IndexedDB can collide — two games that use
+  the same save key overwrite each other. Per-target storage isolation is
+  deliberately deferred.
+- **Games.** A game, SDK or site lock that checks the real hostname
+  (`location.hostname`, `top.location`, the Yandex games SDK) sees the relay's and
+  cannot be satisfied from inside the relay; `document.referrer` is the only
+  such value that is virtualised. `GAME_BLOCK_ADS` is a guess about how each
+  SDK reacts to a refused ad request, so it stays off until a game is known to
+  need it. Cross-origin isolation (`SharedArrayBuffer`, threaded wasm builds) is
+  not available, because the relay does not send the COOP/COEP headers. Some
+  portals block Cloudflare's outbound addresses outright.
+- **Real-path mode trade-offs.** The address bar on those sites carries no
   target host, so a copied bar URL does not work (use the panel's Link
   button). The `__relay_ctx` cookie is shared between tabs, so reloading an
   older real-path tab after opening a different real-path site in another tab
   can land on the wrong site. Reloading a site's root page (`/`) lands on the
-  relay homepage. Sites that read their origin or full URL, not just the path,
-  can still misbehave.
+  relay homepage, and a real-path site whose own page lives at `/settings` or
+  `/cookies` is reached through the relay's own page of that name on a
+  browser-initiated reload. The site list lives in a cookie: it is per browser,
+  capped at 40 sites, and forgotten when cookies are cleared. Sites that read
+  their origin or full URL, not just the path, can still misbehave.
 - **Bot-protected services** (AI chat endpoints such as duck.ai's, which
   answer `418` and ask to "verify you're human" over and over) may still not
   work even with the cookie jar. Their checks also rely on fingerprint and
