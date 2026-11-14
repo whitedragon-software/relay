@@ -123,6 +123,30 @@
   no longer fill the diagnostic panel unless debug mode is on, they are never
   retried by the client or, for the `GAME_AD_HOSTS` hosts, by the Worker, so an
   ad blocker's refusals cannot delay a game's start.
+- Game frames on their own hostname (Settings → **Game frames**). Some games
+  refuse to run unless a portal embeds them — OpenFront on CrazyGames shows "this
+  version can be played exclusively on CrazyGames.com" — and decide by reading the
+  address of the top window (`window.top.location.hostname`), then the referrer.
+  Under the relay the portal and the game share one origin, so the read succeeds
+  and shows the relay's host; no script can change that (`window.top` and
+  `location` cannot be redefined). What changes the outcome is making the two
+  cross-origin, as on the real site, where the read throws and the game falls
+  back to its referrer and "am I in an iframe" checks. When a second hostname is
+  set, a frame navigation (`Sec-Fetch-Dest: iframe`/`frame`) to a game-frame host
+  (`GAME_FRAME_HOSTS`, now also `openfront.io`) is answered with a 302 to
+  `<second host>/https://…` carrying `Referrer-Policy: unsafe-url`, so the game's
+  document, its scripts and its storage live on that origin. The hostname is a
+  custom domain added to the same Worker and must be `https`, differ from the
+  relay's and share its registrable domain (same site, so the Lax login cookie and
+  the page's own cookies still reach it); it is stored in the `__relay_gfo` cookie
+  (`HttpOnly`, one year) and only read on the main origin, so a request already on
+  the second hostname is never redirected again. With a password set, the frame
+  asks for it once on that hostname. Client side: `document.referrer` also
+  unwraps a page of the relay's other hostname (`<other host>/https://real.site/…`),
+  and the navigation guard does not treat the relay's own other hostname as an
+  escape. `openfront.io` is also a game host (`GAME_HOSTS`). A game that reads the
+  real hostname of its own document, or `location.ancestorOrigins` (which cannot
+  be redefined either), is still out of reach.
 - Page markup: a `<meta http-equiv="Content-Security-Policy">` (and the
   report-only variant) is removed. It is the in-markup twin of the CSP header
   the relay already drops, and once everything is served from the relay's
