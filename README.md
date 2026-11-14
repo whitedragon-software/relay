@@ -176,7 +176,10 @@ shows your IP and the one sites see (the button is removed when `IP_WIDGET` is
 **Link** copies a working relay link for the page, and **Copy** puts the failure
 list on the clipboard without DevTools. A failed request to a captcha provider
 is labelled as such. Cloudflare's own `/cdn-cgi/` requests and preload failures
-are filtered out so they don't inflate N. The panel exists on a page after its
+are filtered out so they don't inflate N, and on game sites so are failed
+requests to ad and tracking hosts (Google ad and tag hosts, Bing's pixel,
+IntentIQ, Prebid and similar), which are expected and would bury the failures
+that matter — debug mode shows them again. The panel exists on a page after its
 first failure, on real-path sites, and from page load when the debug bar is on.
 On game sites it is not created after a failure at all (it would sit on top of
 the game), only when the debug bar is on.
@@ -311,7 +314,8 @@ CSS `url()`) works inside files the relay never parses.
   is **not** retried), one retry after a network failure and a capped
   `Retry-After`-aware retry on 429/503 — **both only for `GET`/`HEAD` without a
   body**, so a bodyless `POST` is never sent twice — and a styled error page for
-  Cloudflare edge failures.
+  Cloudflare edge failures. In game context there is one more retry on a
+  transient 5xx (see *Gaming sites*).
 - Caching: edge cache for static assets (GET only), keyed partly on the
   request's `Accept` header with per-status TTLs (`cacheTtlByStatus`);
   Cloudflare's fetch cache; long browser caching for static types (scripts,
@@ -366,6 +370,27 @@ whose target host or whose page (from the `Referer`) is in `GAME_HOSTS`:
   `WebAssembly.instantiateStreaming` works.
 - The debug button is not created after a failed request (see *Diagnostic
   panel*).
+- **Retries** (`GAME_RETRY`, on by default). The Worker retries a `GET`/`HEAD`
+  once, 250 ms later, after a `500`, `502`, `503`, `504` or a Cloudflare edge
+  status (520–524). The injected `fetch` retries a game's `GET` up to twice more
+  (after 0.4 s and 1.2 s) on a network error or a gateway status (502–504,
+  520–524), unless the request was aborted. Requests with a body are never
+  retried, and the client does not retry a `500`, because a game's own API may
+  return one on purpose. The WebSocket handshake is retried once on those
+  statuses for every socket.
+- **Cache lifetimes.** Game assets are kept at Cloudflare's fetch layer for a day
+  (other static assets in game context for an hour; ordinary browsing keeps five
+  minutes). A game asset that upstream marks `no-cache` or `max-age=0` — common
+  for versioned bundles — gets `Cache-Control: public, max-age=3600` instead of
+  being re-downloaded on every replay and counted against the Worker's request
+  quota; `no-store` and `private` are still honoured.
+- **Lean mode** for the document that hosts the game itself
+  (`GAME_FRAME_HOSTS`: `poki-gdn.com`, `html5.gamedistribution.com`, `itch.zone`,
+  `ungrounded.net`, `gamemonetize.co`, `games.crazygames.com`, the Yandex
+  hosts): the client script does not start its DOM mutation watcher there. A game
+  page on a host the list does not know gets the same treatment at runtime when it
+  has a `<canvas>` and fewer than five links. Fetches, sockets, workers and
+  messages still go through the relay.
 - **Ad and analytics refusal** (`GAME_BLOCK_ADS`, **off** by default): requests to
   `GAME_AD_HOSTS` get an empty `403`, which is how a browser ad-blocker looks to
   an SDK (the script's error event fires), so the SDK takes its "no ads" path
@@ -468,7 +493,16 @@ properties so URLs written by JS frameworks are proxied at assignment and read
 back unmodified (this stops React reverting the rewrite); points the `action` of
 forms that POST — including ones inserted by JavaScript — through the relay;
 intercepts clicks and middle-clicks in the capture phase; blocks the target
-site's own Service Worker registration. A `MutationObserver` covers
+site's own Service Worker registration; and, where the browser has the
+Navigation API (Chromium), guards navigations: a script that sets
+`location.href`, `location.assign` or `location.replace` to an address on the
+real site (a canonical-domain redirect, a game's site lock, an SDK sending the
+top window home) is cancelled and redone through the relay, which a page script
+cannot otherwise intercept. A redirect to the page already open is only
+cancelled, more than four guarded navigations in ten seconds (per tab) are
+cancelled without being redone, and form posts and non-cancelable navigations
+are left alone, so the guard cannot loop. Debug mode logs each decision as
+`NAVGUARD`. A `MutationObserver` covers
 `innerHTML`-inserted content. Every patch is feature-tested before it is
 installed — an API the browser does not provide is skipped rather than patched
 blindly — and each risky patch is wrapped in its own `try`/`catch` so one failing
@@ -814,7 +848,9 @@ change.
   virtualize (consent and anti-bot SDKs often do), or loads origin-locked
   resources.
 - The Service Worker route that skips the worker for proxied requests needs
-  Chromium; other browsers wake the worker for every request, as before.
+  Chromium; other browsers wake the worker for every request, as before. The
+  navigation guard needs the Navigation API too, so in Firefox and older Safari a
+  script that assigns `location` to the real site still leaves the relay.
 - Attribute hooks match lowercase names only (`getAttribute("HREF")` is not
   intercepted).
 - `postMessage` target origins are widened to `*`, trading the page author's
