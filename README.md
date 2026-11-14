@@ -108,6 +108,8 @@ form post that redirects back with a short confirmation.
   (`localStorage`, the same key the homepage always used).
 - **Browsing mode** — which sites open in original mode (the default for every
   site) and which in real-path mode; see below.
+- **Game frames** — an optional second hostname for game frames; see *Game
+  frames on their own hostname* below. Empty (off) by default.
 - **Debug bar** — shows the state of debug mode and turns it on or off. On, the
   small `relay` button is present on every page, with the failed-request log, a
   **Link** button and a **Mode** button for the current site. It turns itself
@@ -396,6 +398,37 @@ whose target host or whose page (from the `Referer`) is in `GAME_HOSTS`:
   an SDK (the script's error event fires), so the SDK takes its "no ads" path
   instead of waiting on an ad request. It is off because how each game reacts is
   not predictable; turn it on if ad requests stall a game.
+
+**Game frames on their own hostname.** Some games refuse to run unless a portal
+embeds them (OpenFront on CrazyGames: "this version can be played exclusively on
+CrazyGames.com"). Such a check usually reads `window.top.location.hostname` and
+falls back to `document.referrer` or "am I in an iframe" only when that read
+throws. Under the relay the portal and the game share one origin, so the read
+succeeds and shows the relay's host, and nothing a script can do changes it
+(`window.top` and `location` cannot be redefined). Making the two cross-origin,
+as on the real site, does: give the relay a **second hostname** and the game
+frame is loaded from it.
+
+1. In the Cloudflare dashboard open the Worker → Settings → Domains & Routes →
+   Add → **Custom Domain** and add a hostname under the same domain as the relay
+   (for example `play.<your domain>` next to `relay.<your domain>`). Or in
+   `wrangler.jsonc`: `"routes": [{ "pattern": "play.<your domain>", "custom_domain": true }]`.
+2. In Settings → **Game frames**, enter it and press **Save**.
+
+From then on a frame navigation to a game-frame host (`GAME_FRAME_HOSTS`:
+`poki-gdn.com`, `html5.gamedistribution.com`, `itch.zone`, `ungrounded.net`,
+`gamemonetize.co`, `games.crazygames.com`, `openfront.io`, the Yandex hosts) is
+answered with a 302 to the second hostname, with `Referrer-Policy: unsafe-url` so
+the full portal URL reaches the game as `document.referrer`, which the relay
+already shows as the real URL (including a page of the relay's other hostname).
+The hostname must be `https`, differ from the relay's and share its registrable
+domain, so the Lax login cookie still applies; it is kept in a `__relay_gfo`
+cookie that exists only on the main origin, so a request already on the second
+hostname is never redirected again. The game's storage now lives on that origin
+too, which also separates it from the portal's. With a password set, the game
+frame shows the login page once on the second hostname. A game that reads the
+real hostname of its own document, or `location.ancestorOrigins`, is still out of
+reach.
 
 A portal built as a client-side app (Poki, PlayHop, CrazyGames) also needs
 real-path mode for the **portal**, in Settings; the game's own host
@@ -821,10 +854,13 @@ change.
   `localStorage`/`sessionStorage` and IndexedDB can collide — two games that use
   the same save key overwrite each other. Per-target storage isolation is
   deliberately deferred.
-- **Games.** A game, SDK or site lock that checks the real hostname
-  (`location.hostname`, `top.location`, the Yandex games SDK) sees the relay's and
-  cannot be satisfied from inside the relay; `document.referrer` is the only
-  such value that is virtualised. `GAME_BLOCK_ADS` is a guess about how each
+- **Games.** A game, SDK or site lock that checks the real hostname of its own
+  document (`location.hostname`, the Yandex games SDK) or `location.ancestorOrigins`
+  sees the relay's and cannot be satisfied from inside the relay;
+  `document.referrer` is the only such value that is virtualised. A check of the
+  *top* window's address can be satisfied by the second hostname for game frames
+  (see *Game frames on their own hostname*), at the cost of one more custom
+  domain. `GAME_BLOCK_ADS` is a guess about how each
   SDK reacts to a refused ad request, so it stays off until a game is known to
   need it. Cross-origin isolation (`SharedArrayBuffer`, threaded wasm builds) is
   not available, because the relay does not send the COOP/COEP headers. Some
