@@ -2561,10 +2561,10 @@ async function handleRelayRequest(request, env, ctx) {
         // method and body semantics, the address bar and one-shot content all
         // behave naturally - and each hop passes through the Worker again, so
         // cookies set on a redirect are stored before the next hop is made.
-        upstream = await fetchUpstream(upstreamHref, Object.assign({}, upstreamInit, { redirect: 'manual' }), undefined, { retry5xx: gameCtx && GAME_RETRY });
+        upstream = await fetchUpstream(upstreamHref, Object.assign({}, upstreamInit, { redirect: 'manual' }), undefined, { retry5xx: gameCtx && GAME_RETRY && !GAME_AD_HOSTS.test(parsedTarget.hostname) });
         storeSetCookies(jar, new URL(upstreamHref), getSetCookies(upstream.headers));
       } else {
-        upstream = await fetchUpstream(upstreamHref, upstreamInit, undefined, { retry5xx: gameCtx && GAME_RETRY });
+        upstream = await fetchUpstream(upstreamHref, upstreamInit, undefined, { retry5xx: gameCtx && GAME_RETRY && !GAME_AD_HOSTS.test(parsedTarget.hostname) });
       }
     } catch (error) {
       return errorResponse(proxyOrigin, 502, "Couldn't reach that address", 'The request to the target failed before any response came back.', (derivedHostHint(parsedTarget.hostname, proxyOrigin) + ' ' + error.message).trim(), parsedTarget.href);
@@ -3951,6 +3951,16 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       // Turn on to see exactly which URL page JS handed the router.
       var RELAY_LOG_NAV = RELAY_DEBUG;
 
+      // Ad and analytics URLs. In a game context their failures are expected (an
+      // ad blocker in the browser, a network that refuses them, an SDK probing
+      // for blockers) and would bury the failures that matter, so they are left
+      // out of the panel unless debug mode is on, and they are never retried.
+      var RELAY_AD_HOST = /^https?:\\/\\/([^\\/?#]*\\.)?(doubleclick\\.net|googlesyndication\\.com|googletagservices\\.com|googletagmanager\\.com|google-analytics\\.com|bat\\.bing\\.com|intentiq\\.com|fuseplatform\\.net|amazon-adsystem\\.com|adnxs\\.com|pubmatic\\.com|rubiconproject\\.com|criteo\\.(com|net)|openx\\.net|casalemedia\\.com|smartadserver\\.com|adsafeprotected\\.com|moatads\\.com|scorecardresearch\\.com|hotjar\\.com|connect\\.facebook\\.net|mc\\.yandex\\.(ru|com)|an\\.yandex\\.ru|adfox\\.ru|2mdn\\.net|imasdk\\.googleapis\\.com)(\\/|\\?|#|:|$)/i;
+      var RELAY_AD_PATH = /\\/(ads|prebid)[\\/._-]/i;
+      function relayIsAdUrl(u) {
+        try { return RELAY_AD_HOST.test(u) || RELAY_AD_PATH.test(u); } catch (e) { return false; }
+      }
+
       // Single escape point for the debug panel: rows interpolate strings
       // that are page-controlled (fetch/XHR input URLs) or target-server-
       // controlled (WebSocket close reasons), straight into innerHTML.
@@ -4104,6 +4114,7 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           // POST /cdn-cgi/rum) 404s through the relay by design — it is
           // never a site defect, only log noise.
           if (typeof realUrl === 'string' && realUrl.indexOf('/cdn-cgi/') !== -1) return;
+          if (relayGame && !RELAY_DEBUG && typeof realUrl === 'string' && relayIsAdUrl(realUrl)) return;
           if (!note && typeof realUrl === 'string' && relayIsCaptchaUrl(realUrl)) note = 'captcha provider: may not complete through the relay';
           // In a game context the button would sit on top of the game's own UI
           // (and refused ad requests would raise it on every load), so it is not
@@ -4226,8 +4237,11 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           var attempt = 0;
           var m = String(method || 'GET').toUpperCase();
           var sig = (init && init.signal) || (p && typeof p === 'object' && p.signal) || null;
+          var ustr = '';
+          try { ustr = fromProxied(typeof p === 'string' ? p : ((p && p.url) || '')); } catch (e) {}
           var can = function() {
             if (!relayGame || attempt >= 2) return false;
+            if (relayIsAdUrl(ustr)) return false;
             if (m !== 'GET' && m !== 'HEAD') return false;
             if (sig && sig.aborted) return false;
             return true;
@@ -4689,6 +4703,53 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           }
           return origReplaceState.call(this, state, title, url);
         };
+      } catch (e) {}
+
+      // Navigation guard. Page code that sets location.href / location.assign /
+      // location.replace to an ADDRESS ON THE REAL SITE ("go to the canonical
+      // domain", "this game must run on crazygames.com", an SDK sending the top
+      // window home) leaves the relay, and a page script cannot intercept an
+      // assignment to location. The Navigation API (Chromium) can: it fires a
+      // cancelable "navigate" event for every navigation of this window, also
+      // when another frame (a game's iframe) starts it. A navigation to a
+      // different http(s) origin is cancelled and redone through the relay. Two
+      // things stop it from fighting a page: a redirect to the very page already
+      // open is only cancelled (a redirect loop of a site that dislikes the relay's
+      // hostname would otherwise reload forever), and more than four guarded
+      // navigations in ten seconds (counted per tab) are cancelled without being
+      // redone. Browsers without the API keep the old behaviour. Form posts are
+      // left alone (the server rewrites their action).
+      try {
+        if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+          var relayGuardCount = function() {
+            var now = Date.now();
+            var list = [];
+            try { list = JSON.parse(sessionStorage.getItem('__relay_ng') || '[]'); } catch (x) { list = []; }
+            list = list.filter(function(t) { return now - t < 10000; });
+            list.push(now);
+            try { sessionStorage.setItem('__relay_ng', JSON.stringify(list)); } catch (x) {}
+            return list.length;
+          };
+          window.navigation.addEventListener('navigate', function(e) {
+            try {
+              if (!e.cancelable || e.hashChange || e.formData) return;
+              if (typeof e.downloadRequest === 'string') return;
+              var dest = new URL(e.destination.url);
+              if (!/^https?:$/.test(dest.protocol) || dest.origin === location.origin) return;
+              e.preventDefault();
+              var samePage = false;
+              try { samePage = new URL(relayCurrentRealUrl()).href.split('#')[0] === dest.href.split('#')[0]; } catch (x) {}
+              if (samePage || relayGuardCount() > 4) {
+                if (RELAY_DEBUG) relayLogFailure('NAVGUARD', dest.href, 'CANCELLED', samePage ? 'redirect to this same page' : 'navigation loop');
+                return;
+              }
+              var target = toProxied(dest.href);
+              if (!target || target === dest.href) return;
+              if (RELAY_DEBUG) relayLogFailure('NAVGUARD', dest.href, 'REDIRECT', '-> ' + target);
+              setTimeout(function() { window.location.href = target; }, 0);
+            } catch (x) {}
+          });
+        }
       } catch (e) {}
 
       // Back/forward navigation between pushState entries restores the URL
