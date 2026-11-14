@@ -63,6 +63,29 @@
     policy;
   - the debug button no longer appears over the game after the first failed or
     refused request (debug mode still shows it);
+  - transient failures are retried so one lost asset does not stop a game
+    (`GAME_RETRY`, on by default): the Worker retries a `GET`/`HEAD` once, 250 ms
+    later, after a `500`, `502`, `503`, `504` or a Cloudflare edge status
+    (520–524), and the injected `fetch` retries a game's `GET` up to twice more
+    (after 0.4 s and 1.2 s) on a network error or one of the gateway statuses
+    (502–504, 520–524), unless the request was aborted; requests with a body are
+    never retried, and a `500` is not retried by the client because a game's own
+    API may return one on purpose. The WebSocket handshake is retried once on
+    those statuses for every socket, not only in game context;
+  - cache lifetimes: game assets are kept at Cloudflare's fetch layer for a day
+    (other static assets in game context for an hour, ordinary browsing keeps five
+    minutes), and a game asset that upstream marks `no-cache` or `max-age=0` —
+    common for versioned bundles — gets `Cache-Control: public, max-age=3600`
+    instead of being re-downloaded on every replay and counted against the
+    Worker's request quota; `no-store` and `private` are still honoured;
+  - lean mode for the document that hosts the game itself (`GAME_FRAME_HOSTS`:
+    `poki-gdn.com`, `html5.gamedistribution.com`, `itch.zone`, `ungrounded.net`,
+    `gamemonetize.co`, `games.crazygames.com` and the Yandex hosts): the client
+    script does not start its DOM mutation watcher there, which only costs frame
+    time on a page that keeps updating its own DOM. A game page on a host the list
+    does not know gets the same treatment at runtime when it has a `<canvas>` and
+    fewer than five links. Everything else the script does is unchanged, so a
+    game's fetches, sockets, workers and messages still go through the relay;
   - optional ad and analytics refusal (`GAME_BLOCK_ADS`, **off** by default):
     hosts in `GAME_AD_HOSTS` get an empty `403`, which is what a browser
     ad-blocker looks like to an SDK (the script's error event fires), so the
@@ -78,6 +101,28 @@
   go straight from the browser to third parties, around the relay and showing
   the real IP); `document.referrer` shows the real referring URL instead of
   `<relay>/https://real.site/…`, which game SDKs and embeds check.
+- Navigation guard (Chromium). Page code that sets `location.href`,
+  `location.assign` or `location.replace` to an address on the real site — a
+  "go to the canonical domain" redirect, a game's site lock sending the window
+  to `crazygames.com`, an SDK sending the top window home — used to leave the
+  relay, because a page script cannot intercept an assignment to `location`.
+  The injected script now listens to the Navigation API's cancelable `navigate`
+  event, which fires for every navigation of the window, including one started
+  by a game's iframe, and for a navigation to a different `http(s)` origin it
+  cancels it and redoes it through the relay. It is deliberately timid: a
+  redirect to the very page that is already open is only cancelled (a site that
+  redirects whenever it dislikes the relay's hostname would otherwise reload
+  forever), more than four guarded navigations in ten seconds (counted per tab in
+  `sessionStorage`) are cancelled without being redone, form posts are left alone
+  (the server rewrites their `action`), and a navigation that is not cancelable
+  is left alone. Debug mode logs each decision as `NAVGUARD`. Browsers without
+  the API (Firefox, older Safari) behave as before.
+- Ad and analytics noise. In game context, failed requests to known ad and
+  tracking hosts and to `/ads/` and `/prebid` paths (Google ad and tag hosts,
+  Bing's tracking pixel, IntentIQ, Fuse, Prebid, the Yandex ad hosts and similar)
+  no longer fill the diagnostic panel unless debug mode is on, they are never
+  retried by the client or, for the `GAME_AD_HOSTS` hosts, by the Worker, so an
+  ad blocker's refusals cannot delay a game's start.
 - Page markup: a `<meta http-equiv="Content-Security-Policy">` (and the
   report-only variant) is removed. It is the in-markup twin of the CSP header
   the relay already drops, and once everything is served from the relay's
