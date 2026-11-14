@@ -153,6 +153,9 @@ const SETTINGS_PATH = '/settings';
 // (/settings -> Browsing mode) and remembered in the MODE_COOKIE cookie. Every
 // site starts in original mode.
 const MODE_COOKIE = '__relay_rp';
+// Optional second hostname for GAME FRAMES, chosen in Settings (Game frames) and
+// remembered in this cookie. See the iframe redirect in handleRelayRequest.
+const FRAME_COOKIE = '__relay_gfo';
 const MODE_MAX_SITES = 40;
 // Sites known to need real-path mode (client-side routers that read
 // location.pathname). Offered as one-tap buttons in Settings, never applied
@@ -178,7 +181,7 @@ const COOKIES_PATH = '/cookies';
 // A request is in "game context" when its target host OR the page that made it
 // (from the Referer) matches GAME_HOSTS. Add portals here.
 const GAME_MODE = true;
-const GAME_HOSTS = /(^|\.)(poki\.com|poki-gdn\.com|poki-cdn\.com|playhop\.com|games\.yandex\.(ru|com)|yandex\.net|yastatic\.net|crazygames\.com|gamedistribution\.com|gamemonetize\.com|y8\.com|itch\.io|itch\.zone|kongregate\.com|newgrounds\.com|ungrounded\.net|miniclip\.com|armorgames\.com|addictinggames\.com)$/i;
+const GAME_HOSTS = /(^|\.)(openfront\.io|poki\.com|poki-gdn\.com|poki-cdn\.com|playhop\.com|games\.yandex\.(ru|com)|yandex\.net|yastatic\.net|crazygames\.com|gamedistribution\.com|gamemonetize\.com|y8\.com|itch\.io|itch\.zone|kongregate\.com|newgrounds\.com|ungrounded\.net|miniclip\.com|armorgames\.com|addictinggames\.com)$/i;
 // Ad / analytics hosts refused in game context. The answer is a 403 with an
 // empty body, which is what a browser ad-blocker looks like to an SDK (the
 // script's error event fires), so the SDK takes its "no ads" path and the game
@@ -199,7 +202,7 @@ const GAME_AD_HOSTS = /(^|\.)(googlesyndication\.com|doubleclick\.net|googleadse
 // runs in "lean" mode there (no DOM mutation watcher, which only costs frame
 // time on a page that keeps updating its own DOM). A host missing from this list
 // still gets lean mode at runtime when it has a canvas and almost no links.
-const GAME_FRAME_HOSTS = /(^|\.)(poki-gdn\.com|html5\.gamedistribution\.com|itch\.zone|ungrounded\.net|gamemonetize\.co|games\.crazygames\.com|yandex\.net|yastatic\.net)$/i;
+const GAME_FRAME_HOSTS = /(^|\.)(poki-gdn\.com|html5\.gamedistribution\.com|itch\.zone|ungrounded\.net|gamemonetize\.co|games\.crazygames\.com|openfront\.io|yandex\.net|yastatic\.net)$/i;
 // Game traffic is retried more eagerly than ordinary browsing: one server-side
 // retry of a GET that failed with a transient 5xx / Cloudflare edge status, and
 // up to two client-side retries of a game's fetch() on a network error or such a
@@ -1612,6 +1615,55 @@ function modeCookieHeader(list) {
   return MODE_COOKIE + '=' + encodeURIComponent(list.join('|')) + '; Path=/; Max-Age=31536000; Secure; SameSite=Lax; HttpOnly';
 }
 
+// ---- Game frame origin --------------------------------------------------------
+// A game that reads the TOP window's address (window.top.location.hostname) to
+// check it is embedded by its portal ("this version can be played exclusively on
+// CrazyGames.com") cannot be satisfied while portal and game share one origin:
+// under the relay both are the relay's, so the read succeeds and shows the
+// relay's host. The one thing that changes it is making the two cross-origin,
+// as on the real site, where the same read throws and the game falls back to its
+// referrer / "am I in an iframe" checks (which document.referrer's real-URL
+// getter and the iframe itself satisfy). So when a second hostname is set, the
+// document of a game frame (GAME_FRAME_HOSTS) is loaded from it: the iframe
+// request is redirected there. The hostname must share the relay's registrable
+// domain (same site), so the Lax login cookie and the page's own cookies are
+// still sent to it, and it must be a custom domain added to this same Worker.
+function normalizeFrameOrigin(input, proxyOrigin) {
+  let s = String(input || '').trim();
+  if (!s) return null;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = 'https://' + s;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:') return null;
+  let relayHost;
+  try {
+    relayHost = new URL(proxyOrigin).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+  const host = u.hostname.toLowerCase();
+  if (host === relayHost || siteOf(host) !== siteOf(relayHost)) return null;
+  return 'https://' + host + (u.port ? ':' + u.port : '');
+}
+
+function getFrameOrigin(request, proxyOrigin) {
+  try {
+    const raw = relayGetCookie(request, FRAME_COOKIE);
+    return raw ? normalizeFrameOrigin(raw, proxyOrigin) : null;
+  } catch {
+    return null;
+  }
+}
+
+function frameCookieHeader(origin) {
+  if (!origin) return FRAME_COOKIE + '=; Path=/; Max-Age=0; Secure; SameSite=Lax; HttpOnly';
+  return FRAME_COOKIE + '=' + encodeURIComponent(origin) + '; Path=/; Max-Age=31536000; Secure; SameSite=Lax; HttpOnly';
+}
+
 // ---- Settings page ------------------------------------------------------------
 // o: { hasPassword, debugOn, realHosts, prefill, note, jar }
 function settingsPage(o) {
@@ -1622,7 +1674,10 @@ function settingsPage(o) {
     invalid: 'That does not look like a site address (try poki.com).',
     'debug-on': 'Debug bar is on for 24 hours.',
     'debug-off': 'Debug bar is off.',
-    cookies: 'Cookies cleared.'
+    cookies: 'Cookies cleared.',
+    'frame-set': 'Saved. Game frames now load from that hostname.',
+    'frame-cleared': 'Saved. Game frames load from this hostname again.',
+    'frame-invalid': 'That hostname does not work: it must be https and a different hostname under the same domain as this relay (for example play.' + (o.proxyHost || '').split('.').slice(-2).join('.') + ').'
   };
   const noteText = Object.prototype.hasOwnProperty.call(NOTES, o.note) ? NOTES[o.note] : '';
   const real = o.realHosts || [];
@@ -1664,6 +1719,14 @@ function settingsPage(o) {
       (rows ? '<div class="actions">' + form('cookies_clear_all', {}, 'Clear all cookies') + '<a class="btn" href="' + COOKIES_PATH + '">Cookie names</a></div>' : '') +
       '</section>';
   }
+
+  const frameSection = '<section><h2>Game frames</h2>' +
+    '<p>Some games refuse to run unless a portal embeds them (“can be played exclusively on CrazyGames.com”): they read the address of the top window, and under the relay the portal and the game share one origin, so that check fails. Give the relay a second hostname under the same domain — add it as a <b>custom domain</b> of this Worker in the Cloudflare dashboard — and game frames are loaded from it, which makes the portal and the game different origins, as on the real site.</p>' +
+    '<p class="state">Status: ' + (o.frameOrigin ? 'game frames load from ' + e(o.frameOrigin) : 'off') + '</p>' +
+    '<form method="POST" action="' + SETTINGS_PATH + '"><input type="hidden" name="action" value="frame_set">' +
+    '<div class="field"><input name="origin" value="' + e(o.frameOrigin || '') + '" placeholder="play.' + e((o.proxyHost || '').split('.').slice(-2).join('.')) + '" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" inputmode="url"><button type="submit">Save</button></div></form>' +
+    (o.frameOrigin ? '<div class="actions">' + form('frame_clear', {}, 'Turn off') + '</div>' : '') +
+    '<p class="sub" style="margin-top:12px">If a password is set, the game frame asks for it once on that hostname. Sites that read the real hostname of the game itself are still out of reach.</p></section>';
 
   const ipSection = IP_WIDGET
     ? '<section><h2>Your IP</h2><p>Your address as Cloudflare sees it, and the address sites see when the relay fetches for you. Nothing is looked up until you press the button.</p>' +
@@ -1753,6 +1816,7 @@ function settingsPage(o) {
       <div class="actions">${o.debugOn ? form('debug_off', {}, 'Turn off') : form('debug_on', {}, 'Turn on')}</div>
     </section>
 
+    ${frameSection}
     ${ipSection}
     ${cookieSection}
     ${sessionSection}
@@ -2217,6 +2281,19 @@ async function handleRelayRequest(request, env, ctx) {
             // A stale real-path context would otherwise keep re-routing bare paths.
             headers.append('Set-Cookie', CTX_COOKIE + '=; Path=/; Max-Age=0; Secure; SameSite=Lax');
           }
+        } else if (action === 'frame_set' || action === 'frame_clear') {
+          if (action === 'frame_clear') {
+            headers.append('Set-Cookie', frameCookieHeader(null));
+            note = 'frame-cleared';
+          } else {
+            const fo = normalizeFrameOrigin(form.get('origin'), proxyOrigin);
+            if (fo) {
+              headers.append('Set-Cookie', frameCookieHeader(fo));
+              note = 'frame-set';
+            } else {
+              note = 'frame-invalid';
+            }
+          }
         } else if (action === 'debug_on' || action === 'debug_off') {
           const on = action === 'debug_on';
           headers.append('Set-Cookie', '__relay_debug=' + (on ? '1' : '') + '; Path=/; Max-Age=' + (on ? 86400 : 0) + '; Secure; SameSite=Lax');
@@ -2237,6 +2314,7 @@ async function handleRelayRequest(request, env, ctx) {
         hasPassword: !!(env && env.PASSWORD),
         debugOn: /(?:^|;\s*)__relay_debug=1/.test(request.headers.get('Cookie') || ''),
         realHosts: rpHosts,
+        frameOrigin: getFrameOrigin(request, proxyOrigin),
         prefill: normalizeSiteInput(url.searchParams.get('site')),
         note: url.searchParams.get('note') || '',
         jar: COOKIE_JAR ? loadJar(request) : null
@@ -2454,6 +2532,24 @@ async function handleRelayRequest(request, env, ctx) {
       return new Response(null, { status: 403, headers: { 'Cache-Control': 'no-store', 'X-Relay-Blocked': '1' } });
     }
     const gameAsset = gameCtx && GAME_ASSET_PATH.test(parsedTarget.pathname);
+
+    // Game frames load from the second hostname when one is set (see
+    // normalizeFrameOrigin). Only a frame navigation to a game-frame host is
+    // moved; the cookie that names the hostname exists only on the relay's main
+    // origin, so a request already on the second hostname is never redirected
+    // again. unsafe-url keeps the full portal URL as the Referer across the
+    // cross-origin hop, which the game reads as document.referrer.
+    if (GAME_MODE && request.method === 'GET' &&
+        /^(iframe|frame)$/.test(request.headers.get('Sec-Fetch-Dest') || '') &&
+        GAME_FRAME_HOSTS.test(parsedTarget.hostname)) {
+      const frameOrigin = getFrameOrigin(request, proxyOrigin);
+      if (frameOrigin) {
+        return new Response(null, {
+          status: 302,
+          headers: { 'Location': frameOrigin + '/' + parsedTarget.href, 'Referrer-Policy': 'unsafe-url', 'Cache-Control': 'no-store' }
+        });
+      }
+    }
 
     // Edge cache: identical proxied requests skip origin + rewriting entirely.
     // GET-only — the Cache API throws on non-GET requests.
@@ -4514,7 +4610,15 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           Object.defineProperty(Document.prototype, 'referrer', {
             get: function() {
               var rr = relayRefDesc.get.call(this);
-              try { return fromProxied(rr); } catch (e) { return rr; }
+              try {
+                var ur = fromProxied(rr);
+                if (ur !== rr) return ur;
+                // A frame on the relay's second hostname is referred by a page on
+                // the main one: "<other relay host>/https://real.site/...".
+                var mm = /^https?:\\/\\/([^\\/]+)\\/(https?:\\/\\/.+)$/i.exec(rr);
+                if (mm && mm[1].split('.').slice(-2).join('.') === location.hostname.split('.').slice(-2).join('.')) return mm[2];
+                return rr;
+              } catch (e) { return rr; }
             },
             configurable: true,
             enumerable: relayRefDesc.enumerable
@@ -4736,6 +4840,9 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
               if (typeof e.downloadRequest === 'string') return;
               var dest = new URL(e.destination.url);
               if (!/^https?:$/.test(dest.protocol) || dest.origin === location.origin) return;
+              // The relay's own other hostname (game frames live on their own
+              // origin, see Game frames in Settings) is not an escape.
+              if (dest.hostname.split('.').slice(-2).join('.') === location.hostname.split('.').slice(-2).join('.')) return;
               e.preventDefault();
               var samePage = false;
               try { samePage = new URL(relayCurrentRealUrl()).href.split('#')[0] === dest.href.split('#')[0]; } catch (x) {}
