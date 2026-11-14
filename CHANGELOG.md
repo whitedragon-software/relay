@@ -198,17 +198,6 @@
 - A leftover `__relay_ctx` cookie could keep re-routing bare paths after a
   site was taken out of real-path mode (see Added: per-site browsing mode).
 
-### Known limits
-- All proxied sites share one `localStorage` and IndexedDB, so two games using
-  the same save key can collide.
-- The real-path context cookie (`__relay_ctx`) is shared between tabs: two
-  real-path sites open at once can confuse reload and escape recovery.
-- Games and SDKs that check the real hostname (the Yandex games SDK, site
-  locks) cannot be satisfied from inside the relay, and sites that refuse
-  Cloudflare's outbound addresses cannot be reached at all.
-- `GAME_BLOCK_ADS` is a guess about each SDK's ad-blocker path; it stays off
-  until a game is known to need it.
-
 ## v0.12.0
 
 ### Added
