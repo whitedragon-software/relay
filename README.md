@@ -132,7 +132,7 @@ sites that render nothing or crash in original mode — typically client-side ap
 whose router reads `location.pathname` (Poki renders a blank page in original
 mode; GitHub, BBC and react.dev misbehave). See *Real-path mode* below. You
 switch a site in Settings: type it in the field and press **Use real path**, or
-tap one of the suggestions (`poki.com`, `playhop.com`, `crazygames.com`,
+tap one of the suggestions (`openfront.io`, `poki.com`, `playhop.com`, `crazygames.com`,
 `github.com`, `bbc.com`, `bbc.co.uk`, `react.dev`), then reload the site. Each
 listed site has a **Use original** button that takes it back. The choice is
 remembered **per site, in this browser**: it is stored in one `__relay_rp`
@@ -339,7 +339,10 @@ CSS `url()`) works inside files the relay never parses.
 - A target that is the relay itself is refused, compared by host as well as
   origin, so `http://<relay>` cannot slip past a check made on the `https`
   origin; the WebSocket bridge applies the same check.
-- Timeout (a stalled target is reported as "did not answer within N seconds" and
+- Timeout (20 s for response headers, 90 s in game context and for anything that
+  looks like long-polling — socket.io and Engine.IO endpoints, `?transport=polling`,
+  `?EIO=` — since a held request used to read as a dead target; a stalled target is
+  reported as "did not answer within N seconds" and
   is **not** retried), one retry after a network failure and a capped
   `Retry-After`-aware retry on 429/503 — **both only for `GET`/`HEAD` without a
   body**, so a bodyless `POST` is never sent twice — and a styled error page for
@@ -359,9 +362,16 @@ CSS `url()`) works inside files the relay never parses.
   a cached live playlist stalls playback. A throwing cache lookup counts as a
   miss, never a failed request.
 - WebSockets are bridged browser to Worker to target, including subprotocol
-  negotiation, the real `Origin` and the target's cookies. (A WebSocket
-  handshake carries no `Referer`, so derived hostnames are not translated for
-  sockets.) A Worker's `close()` accepts only 1000 and 3000–4999, so a peer
+  negotiation and the target's cookies. The upstream `Origin` is the real **page's**
+  origin: a handshake carries no `Referer`, so the injected `WebSocket` patch adds
+  the page's origin to the socket URL as `__relay_po`, and the Worker validates it
+  (an `http(s)` origin only), strips it before forwarding and falls back to the
+  target's own origin when it is missing. `Accept-Language`, `Cache-Control` and
+  `Pragma` are forwarded too. (For the same reason derived hostnames are not
+  translated for sockets.) A handshake that fails is answered with the plain HTTP
+  error, except in debug mode, where the socket is accepted and closed at once
+  with code `4000 + status` (4403 refused, 4502 unreachable) and a short reason, so
+  the panel's `WS` entry says why instead of a bare 1006. A Worker's `close()` accepts only 1000 and 3000–4999, so a peer
   closing with 1005, 1006, 1011 and similar is mapped (1001, 1005 or no code to
   1000, anything else to 4011) and the reason is cut short; an error or close on
   either side closes the other, so the two halves can no longer be left open.
@@ -601,7 +611,7 @@ Two constants near the top of `_worker.js` belong to it:
 
 ```js
 const MODE_COOKIE = '__relay_rp';
-const SUGGESTED_REAL_PATH = ['poki.com', 'playhop.com', 'crazygames.com', 'github.com', 'bbc.com', 'bbc.co.uk', 'react.dev'];
+const SUGGESTED_REAL_PATH = ['openfront.io', 'poki.com', 'playhop.com', 'crazygames.com', 'github.com', 'bbc.com', 'bbc.co.uk', 'react.dev'];
 ```
 
 `SUGGESTED_REAL_PATH` only fills the one-tap buttons in Settings; nothing is
@@ -811,6 +821,14 @@ the target.
     address of yours, or fails to connect. With the debug bar on, **Frames** in a
     game's iframe lists its real URL, referrer, top hostname and ancestor origins.
 
+20. Multiplayer: with `openfront.io` switched to real path in Settings, the lobby
+    loads and a game connects (the debug panel shows no `WS` entry). If it does
+    not, turn the debug bar on, reload and read the `WS` entries: `4403` means the
+    game server refused the handshake (an Origin or bot check), `4502` that it
+    could not be reached, a plain `1006` that the failure happened after the
+    handshake. A socket.io game (`/socket.io/?EIO=4&transport=polling`) no longer
+    fails after 20 seconds.
+
 ### Login test sites
 
 Use throwaway accounts: your password passes through your Worker and
@@ -901,6 +919,13 @@ change.
 - **Free-plan WebSocket idle timeout is 100 s.** An idle game or chat
   connection can drop. A keepalive was deliberately not added: it would inject
   unexpected messages into the real application protocol.
+- **Multiplayer games** depend on the relay for every message: a socket goes
+  browser → Cloudflare → Worker → game server, so latency is higher than on the
+  real site and depends on where the Worker runs; a game that matches players by
+  address sees the relay's; a peer-to-peer (WebRTC) game connects as usual unless
+  WebRTC protection is on; a server that refuses connections from Cloudflare's
+  addresses, or checks something about the browser that a proxy cannot reproduce,
+  cannot be reached.
 - **All proxied sites share the relay origin**, so their
   `localStorage`/`sessionStorage` and IndexedDB can collide — two games that use
   the same save key overwrite each other. Per-target storage isolation is
