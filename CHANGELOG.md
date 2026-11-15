@@ -191,6 +191,30 @@
   window (or "blocked (cross-origin)"), `location.ancestorOrigins` and the
   `src` of the iframes it contains. Open the debug bar in each frame (the panel
   exists inside the game's iframe too) to see how the game sees its parent.
+- Multiplayer connections:
+  - the upstream WebSocket handshake now carries the real **page's** origin as
+    `Origin`. A handshake has no `Referer`, so the relay used the target's own
+    origin, which a game server that only accepts its portal's origin (a game
+    server on another host than the page that opens it) refused. The injected
+    `WebSocket` patch adds the page's origin to the socket URL as `__relay_po`;
+    the Worker validates it (`http(s)` origin only), removes it from the query
+    before forwarding, and falls back to the target's origin when it is absent or
+    invalid. The handshake also forwards `Accept-Language`, `Cache-Control` and
+    `Pragma`, which a browser handshake carries and some servers and WAFs look at;
+  - long-polling is no longer cut off: the 20-second wait for response headers
+    read a held request (socket.io's polling transport, Engine.IO, anything
+    `?transport=polling` or `?EIO=`) as a dead target and answered 502, which a
+    game shows as a connection error. Game traffic and those endpoints now wait
+    90 seconds;
+  - a handshake that fails shows why in debug mode. A page's WebSocket cannot read
+    the HTTP answer, only close code 1006. With the debug bar on, the socket is
+    accepted and closed at once with code `4000 + HTTP status` (4403 refused,
+    4502 unreachable) and a short reason (`target refused the socket (HTTP 403)`,
+    `upstream unreachable: …`), which the panel logs as a `WS` entry and the game's
+    own handler can read; without debug mode the plain HTTP error is returned as
+    before;
+  - `openfront.io` is a suggested real-path site, because the game builds its
+    worker and socket addresses from `location`.
 - Page markup: a `<meta http-equiv="Content-Security-Policy">` (and the
   report-only variant) is removed. It is the in-markup twin of the CSP header
   the relay already drops, and once everything is served from the relay's
