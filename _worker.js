@@ -139,6 +139,20 @@
 const SW_PATH = '/__proxy_sw.js';
 const INJECT_PATH = '/__relay_inject.js';
 const SETTINGS_PATH = '/settings';
+const HEALTH_PATH = '/__relay_health';
+// Privacy switches chosen in Settings (cookie on the relay's origin).
+const PRIV_COOKIE = '__relay_priv';
+// Security headers for the relay's OWN pages (home, settings, cookies, login):
+// no MIME sniffing, no framing by another origin, and no Referer to other sites.
+const OWN_PAGE_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'Content-Security-Policy': "frame-ancestors 'self'",
+  'Referrer-Policy': 'same-origin'
+};
+// Targets the relay refuses to connect to, besides the built-in ones (localhost,
+// private / loopback / link-local / reserved IP ranges, .local / .internal ...).
+// Put your own hostnames here as a regex, for example /(^|\.)example\.corp$/i.
+const TARGET_DENY_HOSTS = /^$/;
 
 // "Real path" mode (EXPERIMENTAL). Sites whose client-side router reads
 // location.pathname (Next.js, React Router, GitHub's React apps) can't work
@@ -1567,6 +1581,100 @@ function buildHomeHtml(hasPassword) {
   return html;
 }
 
+// ---- Hardening helpers --------------------------------------------------------
+async function sha256Bytes(text) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text))));
+}
+
+// Constant-time string comparison (both sides are hashed first, so length does
+// not leak either).
+async function safeEqualStrings(a, b) {
+  const [x, y] = await Promise.all([sha256Bytes(a), sha256Bytes(b)]);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+// Failed-login limiter: 8 wrong passwords from one address within 15 minutes
+// lock that address out for 15 minutes. Per Worker instance, so it is a speed
+// bump against guessing, not a global counter.
+const LOGIN_FAILS = new Map();
+const LOGIN_MAX_FAILS = 8;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+function loginLocked(ip) {
+  const r = LOGIN_FAILS.get(ip);
+  return !!(r && r.until && r.until > Date.now());
+}
+function loginFail(ip) {
+  const now = Date.now();
+  let r = LOGIN_FAILS.get(ip);
+  if (!r || now - r.first > LOGIN_WINDOW_MS) r = { n: 0, first: now, until: 0 };
+  r.n += 1;
+  if (r.n >= LOGIN_MAX_FAILS) r.until = now + LOGIN_WINDOW_MS;
+  if (LOGIN_FAILS.size >= 500) LOGIN_FAILS.delete(LOGIN_FAILS.keys().next().value);
+  LOGIN_FAILS.set(ip, r);
+}
+function loginClear(ip) {
+  LOGIN_FAILS.delete(ip);
+}
+
+// A POST to one of the relay's own routes must come from the relay's own
+// origin. Browsers send Sec-Fetch-Site / Origin on form posts; a request that
+// declares itself cross-site (a page on another site posting to the relay) is
+// refused. (Proxied pages share the relay's origin, so this cannot stop them.)
+function isCrossSitePost(request, proxyOrigin) {
+  const sfs = request.headers.get('Sec-Fetch-Site');
+  if (sfs && sfs !== 'same-origin' && sfs !== 'none') return true;
+  const origin = request.headers.get('Origin');
+  if (origin && origin !== proxyOrigin) return true;
+  return false;
+}
+
+function forbiddenPage() {
+  return new Response('Cross-site request refused.', {
+    status: 403,
+    headers: Object.assign({ 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }, OWN_PAGE_HEADERS)
+  });
+}
+
+// Addresses the relay never connects to: loopback, private, link-local (cloud
+// metadata lives there), carrier-grade NAT, multicast and reserved IPv4 ranges,
+// the IPv6 equivalents, and local-only names. A Worker cannot reach most of
+// these anyway; refusing them keeps the relay from being pointed at them.
+function isBlockedTarget(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (!h) return true;
+  if (h === 'localhost' || /\.(localhost|local|internal|localdomain|lan|home\.arpa)$/.test(h)) return true;
+  if (TARGET_DENY_HOSTS.test(h)) return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) {
+    const parts = h.split('.').map(Number);
+    const a = parts[0];
+    const b = parts[1];
+    if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && (b === 168 || (b === 0 && parts[2] === 0))) return true;
+  }
+  if (h.indexOf(':') !== -1) {
+    if (h === '::1' || h === '::' || /^f[cd][0-9a-f]{2}:/.test(h) || /^fe[89ab][0-9a-f]:/.test(h) || /^::ffff:/.test(h)) return true;
+  }
+  return false;
+}
+
+function privCookieHeader(rtc) {
+  if (!rtc) return PRIV_COOKIE + '=; Path=/; Max-Age=0; Secure; SameSite=Lax; HttpOnly';
+  return PRIV_COOKIE + '=rtc; Path=/; Max-Age=31536000; Secure; SameSite=Lax; HttpOnly';
+}
+
+function getRtcBlock(request) {
+  try {
+    return relayGetCookie(request, PRIV_COOKIE) === 'rtc';
+  } catch {
+    return false;
+  }
+}
+
 // ---- Per-site browsing mode ---------------------------------------------------
 // Every site opens in original mode. A site the visitor switched to real-path
 // mode is listed (bare host, no "www.") in the MODE_COOKIE cookie, separated by
@@ -1675,6 +1783,8 @@ function settingsPage(o) {
     'debug-on': 'Debug bar is on for 24 hours.',
     'debug-off': 'Debug bar is off.',
     cookies: 'Cookies cleared.',
+    'rtc-on': 'WebRTC protection is on. Reload the pages you have open.',
+    'rtc-off': 'WebRTC protection is off. Reload the pages you have open.',
     'frame-set': 'Saved. Game frames now load from that hostname.',
     'frame-cleared': 'Saved. Game frames load from this hostname again.',
     'frame-invalid': 'That hostname does not work: it must be https and a different hostname under the same domain as this relay (for example play.' + (o.proxyHost || '').split('.').slice(-2).join('.') + ').'
@@ -1719,6 +1829,11 @@ function settingsPage(o) {
       (rows ? '<div class="actions">' + form('cookies_clear_all', {}, 'Clear all cookies') + '<a class="btn" href="' + COOKIES_PATH + '">Cookie names</a></div>' : '') +
       '</section>';
   }
+
+  const privacySection = '<section><h2>Privacy</h2>' +
+    '<p>A page can learn your real address through WebRTC, which the relay cannot hide on its own. With protection on, WebRTC connections are forced through a relay server, so they stop revealing your address; calls and peer-to-peer games that do not bring such a server may stop working. It applies to pages opened on this hostname.</p>' +
+    '<p class="state">WebRTC protection: ' + (o.rtcBlock ? 'on' : 'off') + '</p>' +
+    '<div class="actions">' + (o.rtcBlock ? form('rtc_off', {}, 'Turn off') : form('rtc_on', {}, 'Turn on')) + '</div></section>';
 
   const frameSection = '<section><h2>Game frames</h2>' +
     '<p>Some games refuse to run unless a portal embeds them (“can be played exclusively on CrazyGames.com”): they read the address of the top window, and under the relay the portal and the game share one origin, so that check fails. Give the relay a second hostname under the same domain — add it as a <b>custom domain</b> of this Worker in the Cloudflare dashboard — and game frames are loaded from it, which makes the portal and the game different origins, as on the real site.</p>' +
@@ -1816,6 +1931,7 @@ function settingsPage(o) {
       <div class="actions">${o.debugOn ? form('debug_off', {}, 'Turn off') : form('debug_on', {}, 'Turn on')}</div>
     </section>
 
+    ${privacySection}
     ${frameSection}
     ${ipSection}
     ${cookieSection}
@@ -1933,15 +2049,15 @@ async function relayIsAuthed(request, env) {
   if (!env || !env.PASSWORD) return true;
   const cookieVal = relayGetCookie(request, AUTH_COOKIE);
   if (!cookieVal) return false;
-  return cookieVal === (await relayHashPassword(env.PASSWORD));
+  return safeEqualStrings(cookieVal, await relayHashPassword(env.PASSWORD));
 }
 
 // Deliberately lean, not sharing HOME_HTML/errorPage's full CSS — a login
 // form doesn't need their trace diagram, theme-toggle JS, or font loading.
 // prefers-color-scheme covers dark mode without needing that JS at all.
-function authPage(redirectTo, wrongPassword) {
+function authPage(redirectTo, wrongPassword, locked) {
   const safeRedirect = escapeHtml(redirectTo || '/');
-  const msg = wrongPassword ? 'Incorrect password.' : 'This relay is password-protected.';
+  const msg = locked ? 'Too many attempts. Try again in a few minutes.' : (wrongPassword ? 'Incorrect password.' : 'This relay is password-protected.');
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -1971,7 +2087,7 @@ function authPage(redirectTo, wrongPassword) {
 <body>
   <form class="box" method="POST" action="${AUTH_PATH}">
     <h1>relay</h1>
-    <p class="${wrongPassword ? 'err' : ''}">${msg}</p>
+    <p class="${wrongPassword || locked ? 'err' : ''}">${msg}</p>
     <input type="hidden" name="redirect" value="${safeRedirect}">
     <div class="field">
       <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password" autocapitalize="none" enterkeyhint="go">
@@ -2019,6 +2135,9 @@ async function handleWebSocketUpgrade(request, url, proxyOrigin) {
   }
   if (parsedTarget.origin.replace(/^wss?/, 'https') === proxyOrigin || parsedTarget.host === url.host) {
     return new Response('Refusing to proxy the relay itself', { status: 400 });
+  }
+  if (isBlockedTarget(parsedTarget.hostname)) {
+    return new Response('Address not allowed', { status: 403 });
   }
 
   const httpEquivalent = parsedTarget.href.replace(/^ws/, 'http');
@@ -2120,6 +2239,15 @@ async function handleRelayRequest(request, env, ctx) {
     const url = new URL(request.url);
     const proxyOrigin = url.origin;
 
+    // Liveness probe for uptime monitors: answered before the password gate and
+    // reveals nothing.
+    if (url.pathname === HEALTH_PATH && (request.method === 'GET' || request.method === 'HEAD')) {
+      return new Response(request.method === 'HEAD' ? null : '{"ok":true}', {
+        status: 200,
+        headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }
+      });
+    }
+
     // Entirely a no-op when env.PASSWORD isn't set — see relayIsAuthed.
     if (env && env.PASSWORD) {
       // Pre-v0.10 URLs.
@@ -2140,6 +2268,7 @@ async function handleRelayRequest(request, env, ctx) {
 
       if (ownRoute && url.pathname === AUTH_PATH) {
         if (request.method === 'POST') {
+          if (isCrossSitePost(request, proxyOrigin)) return forbiddenPage();
           let form;
           try {
             form = await request.formData();
@@ -2149,7 +2278,12 @@ async function handleRelayRequest(request, env, ctx) {
           }
           const submitted = String(form.get('password') || '');
           const redirectTo = safeRedirectPath(String(form.get('redirect') || '/'));
-          if (submitted === env.PASSWORD) {
+          const loginIp = request.headers.get('CF-Connecting-IP') || 'unknown';
+          if (loginLocked(loginIp)) {
+            return Response.redirect(proxyOrigin + AUTH_PATH + '?redirect=' + encodeURIComponent(redirectTo) + '&error=2', 302);
+          }
+          if (await safeEqualStrings(submitted, env.PASSWORD)) {
+            loginClear(loginIp);
             const token = await relayHashPassword(env.PASSWORD);
             const headers = new Headers({ Location: proxyOrigin + redirectTo });
             headers.append(
@@ -2162,6 +2296,7 @@ async function handleRelayRequest(request, env, ctx) {
           // form inline on this POST response — otherwise refreshing after
           // a wrong password re-submits it, and the browser warns about
           // resending form data.
+          loginFail(loginIp);
           const back = AUTH_PATH + '?redirect=' + encodeURIComponent(redirectTo) + '&error=1';
           return Response.redirect(proxyOrigin + back, 302);
         }
@@ -2170,9 +2305,10 @@ async function handleRelayRequest(request, env, ctx) {
         // instead of whatever arbitrary destination was originally requested.
         const redirectTo = safeRedirectPath(url.searchParams.get('redirect') || '/');
         const wrongPassword = url.searchParams.get('error') === '1';
-        return new Response(authPage(redirectTo, wrongPassword), {
-          status: wrongPassword ? 401 : 200,
-          headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        const lockedOut = url.searchParams.get('error') === '2';
+        return new Response(authPage(redirectTo, wrongPassword, lockedOut), {
+          status: lockedOut ? 429 : (wrongPassword ? 401 : 200),
+          headers: Object.assign({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }, OWN_PAGE_HEADERS)
         });
       }
 
@@ -2254,6 +2390,7 @@ async function handleRelayRequest(request, env, ctx) {
     if (url.pathname === SETTINGS_PATH && isRelayOwnRequest(request, url, proxyOrigin)) {
       const rpHosts = getRealPathHosts(request);
       if (request.method === 'POST') {
+        if (isCrossSitePost(request, proxyOrigin)) return forbiddenPage();
         let form;
         try {
           form = await request.formData();
@@ -2281,6 +2418,9 @@ async function handleRelayRequest(request, env, ctx) {
             // A stale real-path context would otherwise keep re-routing bare paths.
             headers.append('Set-Cookie', CTX_COOKIE + '=; Path=/; Max-Age=0; Secure; SameSite=Lax');
           }
+        } else if (action === 'rtc_on' || action === 'rtc_off') {
+          headers.append('Set-Cookie', privCookieHeader(action === 'rtc_on'));
+          note = action === 'rtc_on' ? 'rtc-on' : 'rtc-off';
         } else if (action === 'frame_set' || action === 'frame_clear') {
           if (action === 'frame_clear') {
             headers.append('Set-Cookie', frameCookieHeader(null));
@@ -2315,13 +2455,14 @@ async function handleRelayRequest(request, env, ctx) {
         debugOn: /(?:^|;\s*)__relay_debug=1/.test(request.headers.get('Cookie') || ''),
         realHosts: rpHosts,
         frameOrigin: getFrameOrigin(request, proxyOrigin),
+        rtcBlock: getRtcBlock(request),
         prefill: normalizeSiteInput(url.searchParams.get('site')),
         note: url.searchParams.get('note') || '',
         jar: COOKIE_JAR ? loadJar(request) : null
       });
       return new Response(settingsHtml, {
         status: 200,
-        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
+        headers: Object.assign({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }, OWN_PAGE_HEADERS)
       });
     }
 
@@ -2331,6 +2472,7 @@ async function handleRelayRequest(request, env, ctx) {
     if (COOKIE_JAR && url.pathname === COOKIES_PATH && isRelayOwnRequest(request, url, proxyOrigin)) {
       const jarForPage = loadJar(request);
       if (request.method === 'POST') {
+        if (isCrossSitePost(request, proxyOrigin)) return forbiddenPage();
         let form;
         try {
           form = await request.formData();
@@ -2347,7 +2489,7 @@ async function handleRelayRequest(request, env, ctx) {
       }
       return new Response(cookiesPage(jarForPage), {
         status: 200,
-        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
+        headers: Object.assign({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }, OWN_PAGE_HEADERS)
       });
     }
 
@@ -2449,7 +2591,7 @@ async function handleRelayRequest(request, env, ctx) {
     if (!targetUrl) {
       return new Response(buildHomeHtml(!!(env && env.PASSWORD)), {
         status: 200,
-        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, no-store' }
+        headers: Object.assign({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, no-store' }, OWN_PAGE_HEADERS)
       });
     }
 
@@ -2509,6 +2651,13 @@ async function handleRelayRequest(request, env, ctx) {
     // produce 404/405 noise. Acknowledge and drop them.
     if (parsedTarget.pathname === '/cdn-cgi/rum' || parsedTarget.pathname === '/cdn-cgi/speculation') {
       return new Response(null, { status: 204 });
+    }
+
+    // Private, loopback, link-local and reserved addresses and local-only names
+    // (see isBlockedTarget). Checked after derived-host translation, so the name
+    // that would really be fetched is the one judged.
+    if (isBlockedTarget(parsedTarget.hostname)) {
+      return errorResponse(proxyOrigin, 403, 'Address not allowed', 'This relay does not connect to private, local or reserved addresses.', null, parsedTarget.href);
     }
 
     if (BLOCKED_HOSTS.test(parsedTarget.hostname)) return new Response(null, { status: 204 });
@@ -2897,7 +3046,7 @@ async function handleRelayRequest(request, env, ctx) {
       .on('meta[http-equiv]', new MetaRefreshRewriter(baseUrl, proxyOrigin))
       .on('meta[http-equiv]', new MetaCspRemover())
       .on('head', new BaseTagInjector(proxiedBase))
-      .on('head', new ScriptInjector(proxyOrigin, spoofPath, gameCtx, injected.ver, leanFrame));
+      .on('head', new ScriptInjector(proxyOrigin, spoofPath, gameCtx, injected.ver, leanFrame, getRtcBlock(request)));
 
     const transformed = rewriter.transform(upstream);
 
@@ -3028,6 +3177,23 @@ function buildUpstreamHeaders(request, proxyOrigin, targetOrigin, pageCtxArg) {
 
   if (request.headers.get('Origin')) {
     headers.set('Origin', pageCtx.origin || targetOrigin);
+  }
+
+  // Sec-Fetch-Site describes how the request relates to the PAGE that made it.
+  // The browser sees page and target both on the relay and sends same-origin
+  // for everything; the real site would have said same-site or cross-site, and a
+  // server (or a game's sitelock) that answers differently by it - "only when
+  // embedded by our own portal" - would answer the relay's request wrongly.
+  // 'none' (a navigation the person started) is left as it is.
+  const sfs = headers.get('Sec-Fetch-Site');
+  if (sfs && sfs !== 'none' && pageCtx.origin) {
+    try {
+      const pu = new URL(pageCtx.origin);
+      const tu = new URL(targetOrigin);
+      headers.set('Sec-Fetch-Site', pu.origin === tu.origin ? 'same-origin' : (siteOf(pu.hostname) === siteOf(tu.hostname) ? 'same-site' : 'cross-site'));
+    } catch {
+      // keep what the browser sent
+    }
   }
 
   return headers;
@@ -3533,16 +3699,17 @@ async function getInjected(proxyOrigin, cookieJar) {
 // cacheable file. If an inline script is ever blocked the file falls back to
 // normal mode, so a failure here costs a feature, never the page.
 class ScriptInjector {
-  constructor(proxyOrigin, realPath, gameMode, ver, lean) {
+  constructor(proxyOrigin, realPath, gameMode, ver, lean, rtc) {
     this.proxyOrigin = proxyOrigin;
     this.realPath = realPath || '';
     this.gameMode = !!gameMode;
     this.ver = ver;
     this.lean = !!lean;
+    this.rtc = !!rtc;
   }
   element(el) {
     const cfg = 'window.__relayCfg={p:' + JSON.stringify(this.realPath).replace(/</g, '\\u003c') +
-      ',g:' + (this.gameMode ? 1 : 0) + ',l:' + (this.lean ? 1 : 0) + '};';
+      ',g:' + (this.gameMode ? 1 : 0) + ',l:' + (this.lean ? 1 : 0) + ',r:' + (this.rtc ? 1 : 0) + '};';
     const src = this.proxyOrigin + INJECT_PATH + '?v=' + this.ver;
     el.prepend('<script>' + cfg + '</script><script src="' + escapeHtml(src) + '"></script>', { html: true });
   }
@@ -3565,6 +3732,8 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       // Lean mode: this document hosts a game itself (see GAME_FRAME_HOSTS), so
       // the DOM mutation watcher is not started.
       var relayLean = !!(self.__relayCfg && self.__relayCfg.l);
+      // WebRTC protection (Settings -> Privacy): see the RTCPeerConnection patch.
+      var relayRtc = !!(self.__relayCfg && self.__relayCfg.r);
       // Cookie jar (see COOKIE_JAR on the server): document.cookie is replaced
       // by a shim over the jar cookies. Everything in this script that needs
       // the page's REAL cookie string (the relay's own debug and context
@@ -4097,6 +4266,8 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:4px 9px;">IP</button>' +
           '<button id="__relay_debug_mode" title="Switch this site between original and real-path mode" style="background:none;border:1px solid #444;' +
           'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:4px 9px;">Mode</button>' +
+          '<button id="__relay_debug_frames" title="Show how this frame sees its parent" style="background:none;border:1px solid #444;' +
+          'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:4px 9px;">Frames</button>' +
           '<button id="__relay_debug_link" title="Copy a relay link to this page" style="background:none;border:1px solid #444;' +
           'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:4px 9px;">Link</button>' +
           '<button id="__relay_debug_copy" style="background:none;border:1px solid #444;' +
@@ -4135,6 +4306,11 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
             window.location.href = proxyOrigin + '/settings?site=' + encodeURIComponent(new URL(relayCurrentRealUrl()).hostname);
           } catch (x) {}
         });
+        document.getElementById('__relay_debug_frames').addEventListener('click', function(e) {
+          if (e.isTrusted === false) return;
+          try { relayFramesInfo = relayCollectFrames(); } catch (x) { relayFramesInfo = ['frames info unavailable']; }
+          relayRenderList();
+        });
         document.getElementById('__relay_debug_link').addEventListener('click', function() {
           var lbtn = document.getElementById('__relay_debug_link');
           function ldone(ok) { lbtn.textContent = ok ? 'Copied!' : 'Copy failed'; setTimeout(function() { lbtn.textContent = 'Link'; }, 1500); }
@@ -4162,6 +4338,31 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       // The IP check runs only when the person presses IP, and is never stored
       // (not in the log history, not in Copy).
       var relayIpInfo = null;
+      // "Frames": how this document sees its surroundings. Written for site locks
+      // ("can be played exclusively on ..."), which read exactly these values.
+      var relayFramesInfo = null;
+      function relayCollectFrames() {
+        var out = [];
+        out.push('this frame: ' + relayCurrentRealUrl());
+        out.push('is top window: ' + (window.top === window));
+        out.push('location.hostname: ' + location.hostname);
+        out.push('document.referrer: ' + (document.referrer || '(empty)'));
+        try { out.push('top hostname: ' + window.top.location.hostname); } catch (e) { out.push('top hostname: blocked (cross-origin)'); }
+        try { out.push('ancestorOrigins: ' + (Array.prototype.join.call(location.ancestorOrigins || [], ', ') || '(none)')); } catch (e) { out.push('ancestorOrigins: unavailable'); }
+        try {
+          var frs = document.querySelectorAll('iframe');
+          for (var i = 0; i < frs.length && i < 8; i++) {
+            var raw = relayNativeGetAttr.call(frs[i], 'src') || '(no src)';
+            out.push('iframe ' + (i + 1) + ': ' + raw);
+          }
+        } catch (e) {}
+        return out;
+      }
+      function relayFramesRows() {
+        if (!relayFramesInfo) return '';
+        var st = 'padding:6px 8px;border-bottom:1px solid #262626;color:#fc9;word-break:break-all;';
+        return relayFramesInfo.map(function(l) { return '<div style="' + st + '">' + relayEsc(l) + '</div>'; }).join('');
+      }
       function relayLoadIps() {
         relayIpInfo = { loading: true };
         relayRenderList();
@@ -4193,7 +4394,7 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
         try {
           var list = document.getElementById('__relay_debug_list');
           if (!list) return;
-          list.innerHTML = relayIpRows() + '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#8fb4ff;' +
+          list.innerHTML = relayIpRows() + relayFramesRows() + '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#8fb4ff;' +
             'word-break:break-all;">page: ' + relayEsc(relayCurrentRealUrl()) + '</div>' + relayRows().map(function(r) {
             return '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#eee;' +
               'word-break:break-all;">' + (r.t ? '<span style="color:#789;">' + relayEsc(r.t) + '</span> ' : '') +
@@ -4548,6 +4749,29 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           PatchedWebSocket.CLOSING = OrigWebSocket.CLOSING;
           PatchedWebSocket.CLOSED = OrigWebSocket.CLOSED;
           window.WebSocket = PatchedWebSocket;
+        }
+      } catch (e) {}
+
+      // WebRTC leaks the visitor's real address (host and server-reflexive ICE
+      // candidates), which no header handling can hide. With protection on, every
+      // RTCPeerConnection is created with iceTransportPolicy 'relay': only
+      // candidates through a TURN server are used, so a connection either goes via
+      // a relay server or does not form.
+      try {
+        if (relayRtc) {
+          ['RTCPeerConnection', 'webkitRTCPeerConnection'].forEach(function(name) {
+            var OrigRtc = window[name];
+            if (typeof OrigRtc !== 'function') return;
+            var PatchedRtc = function(cfg, constraints) {
+              var c = {};
+              try { c = Object.assign({}, cfg || {}); } catch (e) {}
+              c.iceTransportPolicy = 'relay';
+              return constraints !== undefined ? new OrigRtc(c, constraints) : new OrigRtc(c);
+            };
+            PatchedRtc.prototype = OrigRtc.prototype;
+            if (OrigRtc.generateCertificate) PatchedRtc.generateCertificate = OrigRtc.generateCertificate;
+            window[name] = PatchedRtc;
+          });
         }
       } catch (e) {}
 
