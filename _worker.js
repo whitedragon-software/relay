@@ -174,7 +174,7 @@ const MODE_MAX_SITES = 40;
 // Sites known to need real-path mode (client-side routers that read
 // location.pathname). Offered as one-tap buttons in Settings, never applied
 // automatically.
-const SUGGESTED_REAL_PATH = ['poki.com', 'playhop.com', 'crazygames.com', 'github.com', 'bbc.com', 'bbc.co.uk', 'react.dev'];
+const SUGGESTED_REAL_PATH = ['openfront.io', 'poki.com', 'playhop.com', 'crazygames.com', 'github.com', 'bbc.com', 'bbc.co.uk', 'react.dev'];
 const CTX_COOKIE = '__relay_ctx';
 const DEBUG_PATH = '/__relay_debug';
 // OPTIONAL speed switch, OFF by default: hostnames matching this are answered
@@ -2121,8 +2121,43 @@ function wsSafeClose(sock, code, reason) {
 // Cloudflare Workers negotiate an OUTBOUND WebSocket via a plain http(s)
 // fetch() with an Upgrade header set — not a literal wss:// URL — and the
 // far end is then exposed as `response.webSocket`.
+// A handshake that cannot be completed is normally answered with an HTTP error,
+// which a page's WebSocket cannot read (it only sees close code 1006). In debug
+// mode the socket is instead accepted and closed at once with a code that names
+// the failure (4000 + the HTTP status: 4403 = refused, 4502 = unreachable) and a
+// short reason, so the page's panel and the game's own handler can see why.
+function wsHandshakeFailure(request, status, text) {
+  const debug = /(?:^|;\s*)__relay_debug=1/.test(request.headers.get('Cookie') || '');
+  if (debug) {
+    try {
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      server.close(4000 + (Number(status) % 1000 || 500), String(text || '').slice(0, 100));
+      return new Response(null, { status: 101, webSocket: client });
+    } catch {
+      // fall through to the plain answer
+    }
+  }
+  return new Response(text, { status: status || 502 });
+}
+
 async function handleWebSocketUpgrade(request, url, proxyOrigin) {
-  const targetUrl = url.pathname.slice(1) + url.search;
+  // The page's own origin travels in the query as __relay_po (the injected
+  // WebSocket patch adds it; a handshake carries no Referer, so there is no other
+  // way to know which page opened the socket). It is removed before forwarding.
+  let pageOrigin = null;
+  let search = url.search;
+  const poMatch = /[?&]__relay_po=([^&]*)/.exec(search);
+  if (poMatch) {
+    try {
+      const candidate = decodeURIComponent(poMatch[1]);
+      if (/^https?:\/\/[^\/\s]+$/i.test(candidate)) pageOrigin = new URL(candidate).origin;
+    } catch {
+      pageOrigin = null;
+    }
+    search = search.replace(/([?&])__relay_po=[^&]*(&|$)/, (m, a, b) => (b === '&' ? a : ''));
+  }
+  const targetUrl = url.pathname.slice(1) + search;
   if (!/^wss?:\/\//i.test(targetUrl)) {
     return new Response('Invalid WebSocket target', { status: 400 });
   }
@@ -2146,9 +2181,10 @@ async function handleWebSocketUpgrade(request, url, proxyOrigin) {
   const upstreamHeaders = new Headers({
     'Upgrade': 'websocket',
     'Connection': 'Upgrade',
-    // Real target origin, not our proxy's — many WebSocket servers reject
-    // the handshake outright if Origin doesn't match their own site.
-    'Origin': realOrigin,
+    // The real PAGE's origin (hinted by the client), else the target's own — not
+    // our proxy's: many WebSocket servers reject the handshake outright if
+    // Origin doesn't match the site that is allowed to open the socket.
+    'Origin': pageOrigin || realOrigin,
     // Real browser UA, not a fixed spoofed one — see buildUpstreamHeaders.
     'User-Agent': request.headers.get('User-Agent') || FALLBACK_USER_AGENT
   });
@@ -2158,6 +2194,11 @@ async function handleWebSocketUpgrade(request, url, proxyOrigin) {
   // socket.protocol is empty and strict clients reject the connection.
   const requestedProtocol = request.headers.get('Sec-WebSocket-Protocol');
   if (requestedProtocol) upstreamHeaders.set('Sec-WebSocket-Protocol', requestedProtocol);
+  // A real browser handshake also carries these; some servers and WAFs look.
+  for (const h of ['Accept-Language', 'Cache-Control', 'Pragma']) {
+    const v = request.headers.get(h);
+    if (v) upstreamHeaders.set(h, v);
+  }
 
   // The visitor's cookies for the target, so socket handshakes that
   // authenticate by cookie work.
@@ -2179,12 +2220,12 @@ async function handleWebSocketUpgrade(request, url, proxyOrigin) {
     // rather than leaving the connecting UI hanging indefinitely.
     upstream = await fetchUpstream(httpEquivalent, { headers: upstreamHeaders }, 10000, { retry5xx: true });
   } catch (err) {
-    return new Response('WebSocket upstream connection failed: ' + err.message, { status: 502 });
+    return wsHandshakeFailure(request, 502, 'upstream unreachable: ' + err.message);
   }
 
   const upstreamSocket = upstream.webSocket;
   if (!upstreamSocket) {
-    return new Response('Target did not upgrade to WebSocket', { status: 502 });
+    return wsHandshakeFailure(request, upstream.status >= 400 ? upstream.status : 502, 'target refused the socket (HTTP ' + upstream.status + ')');
   }
 
   let client, server;
@@ -2797,6 +2838,12 @@ async function handleRelayRequest(request, env, ctx) {
     }
 
     const upstreamHref = stripProxyFromQuery(parsedTarget, proxyOrigin, pageCtx.origin);
+    // Long-polling (socket.io's polling transport, Engine.IO, SSE-like endpoints)
+    // holds a response for 25-30 s before sending headers, which the 20 s header
+    // timeout read as a dead target and turned into a 502: "connection error".
+    // Game traffic and anything that looks like long-polling gets 90 s.
+    const upstreamTimeout = (gameCtx || /\/socket\.io\/|\/engine\.io\/|[?&]transport=polling|[?&]EIO=/i.test(parsedTarget.pathname + parsedTarget.search))
+      ? 90000 : undefined;
 
     let upstream;
     try {
@@ -2806,10 +2853,10 @@ async function handleRelayRequest(request, env, ctx) {
         // method and body semantics, the address bar and one-shot content all
         // behave naturally - and each hop passes through the Worker again, so
         // cookies set on a redirect are stored before the next hop is made.
-        upstream = await fetchUpstream(upstreamHref, Object.assign({}, upstreamInit, { redirect: 'manual' }), undefined, { retry5xx: gameCtx && GAME_RETRY && !GAME_AD_HOSTS.test(parsedTarget.hostname) });
+        upstream = await fetchUpstream(upstreamHref, Object.assign({}, upstreamInit, { redirect: 'manual' }), upstreamTimeout, { retry5xx: gameCtx && GAME_RETRY && !GAME_AD_HOSTS.test(parsedTarget.hostname) });
         storeSetCookies(jar, new URL(upstreamHref), getSetCookies(upstream.headers));
       } else {
-        upstream = await fetchUpstream(upstreamHref, upstreamInit, undefined, { retry5xx: gameCtx && GAME_RETRY && !GAME_AD_HOSTS.test(parsedTarget.hostname) });
+        upstream = await fetchUpstream(upstreamHref, upstreamInit, upstreamTimeout, { retry5xx: gameCtx && GAME_RETRY && !GAME_AD_HOSTS.test(parsedTarget.hostname) });
       }
     } catch (error) {
       return errorResponse(proxyOrigin, 502, "Couldn't reach that address", 'The request to the target failed before any response came back.', (derivedHostHint(parsedTarget.hostname, proxyOrigin) + ' ' + error.message).trim(), parsedTarget.href);
@@ -4727,6 +4774,12 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
               proxied = url;
               realTarget = url;
             }
+            // Tell the Worker which real page opens the socket (a handshake has no
+            // Referer); it becomes the Origin of the upstream handshake.
+            try {
+              var wsPageOrigin = new URL(realBase()).origin;
+              proxied = proxied + (proxied.indexOf('?') === -1 ? '?' : '&') + '__relay_po=' + encodeURIComponent(wsPageOrigin);
+            } catch (e) {}
             var sock = protocols !== undefined
               ? new OrigWebSocket(proxied, protocols)
               : new OrigWebSocket(proxied);
