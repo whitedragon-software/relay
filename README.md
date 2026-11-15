@@ -108,6 +108,10 @@ form post that redirects back with a short confirmation.
   (`localStorage`, the same key the homepage always used).
 - **Browsing mode** — which sites open in original mode (the default for every
   site) and which in real-path mode; see below.
+- **Privacy** — **WebRTC protection**: forces WebRTC connections through a relay
+  server so a page cannot learn your real address through them (see
+  *Limitations*). Off by default; it can stop calls and peer-to-peer games that
+  bring no relay server.
 - **Game frames** — an optional second hostname for game frames; see *Game
   frames on their own hostname* below. Empty (off) by default.
 - **Debug bar** — shows the state of debug mode and turns it on or off. On, the
@@ -175,6 +179,10 @@ top-right button, `relay · N`. It never opens by itself: click to expand.
 Inside, the first line (`page: …`) shows the current page's real URL, **IP**
 shows your IP and the one sites see (the button is removed when `IP_WIDGET` is
 `false`), **Mode** opens Settings for the current site (see *Browsing mode*),
+**Frames** shows how the frame sees its surroundings — whether it is the top
+window, its real URL, `location.hostname`, the real referrer, the top window's
+hostname (or "blocked (cross-origin)"), `location.ancestorOrigins` and its
+iframes, which is what site locks read —
 **Link** copies a working relay link for the page, and **Copy** puts the failure
 list on the clipboard without DevTools. A failed request to a captcha provider
 is labelled as such. Cloudflare's own `/cdn-cgi/` requests and preload failures
@@ -219,6 +227,7 @@ their own.
 | `/login`, `/logout` | Password gate (only with `PASSWORD`). |
 | `/__relay_ip` | IP lookup JSON (GET/HEAD), behind the password gate. |
 | `/__relay_debug` | Turns debug mode on (`?on=0` off) for 24 hours. |
+| `/__relay_health` | `{"ok":true}` for uptime monitors; answered before the password gate. |
 | `/__relay_inject.js?v=<hash>` | The injected client script, cached for a year. |
 | `/__proxy_sw.js` | The relay's Service Worker. |
 | `/favicon.ico`, `/robots.txt` | Answered at the root so they never enter target recovery. |
@@ -309,6 +318,24 @@ CSS `url()`) works inside files the relay never parses.
   `X-Forwarded-For`, `True-Client-IP`, `X-Real-IP`, `Forwarded`, `Via`,
   `CDN-Loop` and the `cf-` geo headers (city, region, postal code, timezone,
   latitude, longitude and so on) are all dropped.
+- **Refused targets.** Private, loopback, link-local (cloud metadata),
+  carrier-grade NAT, multicast and reserved IPv4 ranges, their IPv6 equivalents
+  and local-only names (`localhost`, `.local`, `.internal`, `.localdomain`, `.lan`,
+  `.home.arpa`) are answered with a 403 page, in the Worker and in the WebSocket
+  bridge; `TARGET_DENY_HOSTS` (a regex, empty by default) adds your own.
+- **`Sec-Fetch-Site`** sent upstream describes the request as the real site
+  would see it: the browser reports `same-origin` for everything (page and target
+  are both the relay), so the relay sends `same-origin`, `same-site` or
+  `cross-site` from the real page's origin and the target's, and leaves `none`
+  (a navigation the person started) alone. Servers and sitelocks that answer
+  differently by it are no longer told the wrong thing.
+- **The relay's own pages** carry `frame-ancestors 'self'`, `nosniff` and
+  `Referrer-Policy: same-origin`, and a `POST` to `/login`, `/settings` or
+  `/cookies` that declares itself cross-site is refused with a 403.
+- **Login protection.** Eight wrong passwords from one address within 15 minutes
+  lock that address out for 15 minutes (a 429 login page; counted per Worker
+  instance, so a speed bump against guessing, not a global counter); the password
+  and the session cookie are compared in constant time.
 - A target that is the relay itself is refused, compared by host as well as
   origin, so `http://<relay>` cannot slip past a check made on the `https`
   origin; the WebSocket bridge applies the same check.
@@ -429,6 +456,17 @@ too, which also separates it from the portal's. With a password set, the game
 frame shows the login page once on the second hostname. A game that reads the
 real hostname of its own document, or `location.ancestorOrigins`, is still out of
 reach.
+
+**CrazyGames' own block.** The "Oooops … This version can be played exclusively
+on CrazyGames.com" screen is not OpenFront's: it is CrazyGames' block on
+embedding newer games outside crazygames.com, applied by their game frame. A
+relay is exactly such an embedding. The second hostname only helps if that frame
+decides by reading the top window's address or the referrer; if it reads
+`location.ancestorOrigins`, which cannot be redefined, nothing in the relay can
+satisfy it. Turn the debug bar on and press **Frames** inside the game frame to
+see what it can read. A game that also lives on its own domain does not have the
+problem: OpenFront runs at `openfront.io`, so open `relay/https://openfront.io`
+directly (it is a game host, so the game-site handling applies).
 
 A portal built as a client-side app (Poki, PlayHop, CrazyGames) also needs
 real-path mode for the **portal**, in Settings; the game's own host
@@ -761,6 +799,18 @@ the target.
     the response headers in DevTools; a Range request (a video seek) is answered
     with `206` from upstream, not a cached full body.
 
+18. Hardening: `/https://127.0.0.1/`, `/https://localhost/` and
+    `/https://169.254.169.254/` answer a 403 "Address not allowed" page;
+    `/__relay_health` answers `{"ok":true}` (also with a password set and signed
+    out); the response headers of the homepage and Settings include
+    `Content-Security-Policy: frame-ancestors 'self'`; with a password set, eight
+    wrong passwords in a row from one address give the 429 "Too many attempts"
+    login page even for the right password, and another address is unaffected.
+19. Privacy and frames: Settings → Privacy → **Turn on**, reload a page that opens
+    a `RTCPeerConnection` (for example a WebRTC leak-test page) — it shows no
+    address of yours, or fails to connect. With the debug bar on, **Frames** in a
+    game's iframe lists its real URL, referrer, top hostname and ancestor origins.
+
 ### Login test sites
 
 Use throwaway accounts: your password passes through your Worker and
@@ -811,9 +861,10 @@ change.
   through a proxy: use throwaway accounts.
 - **Your IP: what is and is not hidden.** The relay never forwards your IP in
   headers, so sites you fetch through it see the relay's outbound address, not
-  yours — but Cloudflare, and whoever runs the Worker, see it. It is not hidden
-  from WebRTC (a page can discover your address through a peer connection, which
-  the relay does not intercept), and the IP endpoint adds one more way to read
+  yours — but Cloudflare, and whoever runs the Worker, see it. It is hidden
+  from WebRTC only when **WebRTC protection** is on in Settings (a page can
+  otherwise discover your address through a peer connection, which the relay does
+  not intercept), and the IP endpoint adds one more way to read
   it: every proxied page shares the relay's origin, so a script written to attack
   the relay could fetch `/__relay_ip` — setting `IP_WIDGET` to `false` removes
   the endpoint and closes that particular route, though the shared origin itself
@@ -891,8 +942,9 @@ change.
   intercepted).
 - `postMessage` target origins are widened to `*`, trading the page author's
   origin check for cross-frame messages that work under the relay.
-- The password gate has no rate limiting, a non-timing-safe comparison, and a
-  session cookie that holds a hash of the password. The `Secure` session cookie
+- The password gate limits guessing only per Worker instance (8 wrong passwords
+  per address and 15 minutes), has no second factor, and uses a session cookie
+  that holds a hash of the password. The `Secure` session cookie
   loops the login on plain-HTTP local development, and so do the cookie jar's
   `Secure` cookies. It keeps casual visitors and crawlers out; it is not
   hardened access control.
