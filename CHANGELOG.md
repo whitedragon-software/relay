@@ -146,7 +146,51 @@
   and the navigation guard does not treat the relay's own other hostname as an
   escape. `openfront.io` is also a game host (`GAME_HOSTS`). A game that reads the
   real hostname of its own document, or `location.ancestorOrigins` (which cannot
-  be redefined either), is still out of reach.
+  be redefined either), is still out of reach. The "Oooops … This version can be
+  played exclusively on CrazyGames.com" screen is CrazyGames' own block on
+  embedding newer games outside crazygames.com; whether the second hostname gets
+  past it depends on how that wrapper checks, which only the frame diagnostics
+  (below) can show. A game that exists on its own domain (OpenFront at
+  `openfront.io`) can be opened there directly, with no portal check at all.
+- Hardening of the relay itself:
+  - login: a wrong password no longer costs nothing — 8 wrong passwords from one
+    address within 15 minutes lock that address out for 15 minutes (a `429` login
+    page; counted per Worker instance, so a speed bump against guessing rather
+    than a global counter); the password and the session cookie are compared in
+    constant time (both sides hashed first, so length does not leak); a correct
+    login clears the count;
+  - cross-site posts: a `POST` to `/login`, `/settings` or `/cookies` that
+    declares itself cross-site (`Sec-Fetch-Site` other than `same-origin`/`none`,
+    or an `Origin` other than the relay's) is refused with a `403`. Proxied pages
+    share the relay's origin, so this stops other sites, not proxied ones;
+  - the relay's own pages (home, Settings, `/cookies`, login) carry
+    `Content-Security-Policy: frame-ancestors 'self'`, `X-Content-Type-Options:
+    nosniff` and `Referrer-Policy: same-origin`, and Settings, `/cookies` and login
+    are `no-store`, so no other site can frame them (clickjacking a Settings
+    button) and nothing is sniffed or leaked in a Referer;
+  - refused targets: private, loopback, link-local (cloud metadata), carrier-grade
+    NAT, multicast and reserved IPv4 ranges, their IPv6 equivalents (`::1`,
+    `fc00::/7`, `fe80::/10`, IPv4-mapped) and local-only names (`localhost`,
+    `.local`, `.internal`, `.localdomain`, `.lan`, `.home.arpa`) get a `403` page, in
+    the Worker and in the WebSocket bridge, and `TARGET_DENY_HOSTS` takes your own
+    regex. A Worker cannot reach most of these anyway; the point is that the relay
+    cannot be aimed at them;
+  - `/__relay_health` answers `{"ok":true}` before the password gate, for uptime
+    monitors, and reveals nothing else.
+- Privacy: Settings → **Privacy** has a **WebRTC protection** switch. A page can
+  learn the visitor's real address through WebRTC (host and server-reflexive ICE
+  candidates), which no header handling can hide. With the switch on, every
+  `RTCPeerConnection` is created with `iceTransportPolicy: 'relay'`, so only
+  candidates through a TURN server are used and a connection either goes through
+  one or does not form; calls and peer-to-peer games that bring no relay server
+  may stop working. It is a `__relay_priv` cookie (`HttpOnly`, one year), applies
+  to pages opened on that hostname, and is off by default.
+- Frame diagnostics: the debug panel has a **Frames** button showing what a
+  site lock reads — whether the document is the top window, its real URL,
+  `location.hostname`, the real `document.referrer`, the hostname of the top
+  window (or "blocked (cross-origin)"), `location.ancestorOrigins` and the
+  `src` of the iframes it contains. Open the debug bar in each frame (the panel
+  exists inside the game's iframe too) to see how the game sees its parent.
 - Page markup: a `<meta http-equiv="Content-Security-Policy">` (and the
   report-only variant) is removed. It is the in-markup twin of the CSP header
   the relay already drops, and once everything is served from the relay's
@@ -154,6 +198,13 @@
   images and requests.
 
 ### Changed
+- `Sec-Fetch-Site` sent upstream now describes the request as the real site
+  would have seen it. The browser sees the page and the target both on the relay
+  and sends `same-origin` for everything; the relay now sends `same-origin`,
+  `same-site` or `cross-site` from the real page's origin and the target's, and
+  leaves `none` (a navigation the person started) alone. A server or a game's
+  sitelock that answers differently by it — "only when embedded by our own
+  portal" — used to be told the wrong thing.
 - Real-path mode is no longer a hard-coded list. `REAL_PATH_HOSTS` is gone and
   no site uses real-path mode until it is switched in Settings. **Upgrade
   note:** `bbc.com`, `bbc.co.uk`, `github.com` and `react.dev` previously
