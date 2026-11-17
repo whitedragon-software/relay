@@ -378,44 +378,16 @@ function derivedHostHint(targetHost, proxyOrigin) {
 const COOKIE_JAR = true;
 const JAR_PREFIX = '__rj_';
 const JAR_COOKIE_MAX = 3800;      // one relay cookie, name + value (browsers cap a cookie near 4 KB)
-const JAR_SITE_MAX = 8000;        // all of one site's cookies together (large sign-in providers set many)
-const JAR_BUDGET = 14000;         // every jar cookie together; keeps the Cookie header under Cloudflare's 16 KB per-header limit
+const JAR_SITE_MAX = 6000;        // all of one site's cookies together
+const JAR_BUDGET = 10000;         // every jar cookie together; keeps the Cookie header small
 const JAR_MAX_AGE_MS = 400 * 24 * 3600 * 1000;
 // There is no public-suffix list in a single-file Worker; these multi-label
 // suffixes are the common ones, so a site cannot set a cookie for "co.uk".
 const TWO_LEVEL_SUFFIXES = new Set([
-  // second-level registries of country domains
-  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk', 'ltd.uk', 'plc.uk', 'net.uk', 'sch.uk',
-  'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au', 'asn.au', 'id.au',
-  'co.jp', 'or.jp', 'ne.jp', 'ac.jp', 'go.jp', 'ed.jp', 'gr.jp',
-  'co.nz', 'org.nz', 'ac.nz', 'govt.nz', 'net.nz', 'school.nz',
-  'co.in', 'net.in', 'org.in', 'gov.in', 'ac.in', 'edu.in', 'nic.in', 'res.in', 'firm.in', 'gen.in', 'ind.in',
-  'co.kr', 'or.kr', 'ne.kr', 'ac.kr', 'go.kr', 're.kr', 'pe.kr',
-  'com.br', 'net.br', 'org.br', 'gov.br', 'edu.br', 'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
-  'com.mx', 'org.mx', 'gob.mx', 'edu.mx', 'net.mx', 'com.tr', 'org.tr', 'gov.tr', 'edu.tr', 'net.tr', 'gen.tr', 'web.tr', 'biz.tr',
-  'com.sg', 'edu.sg', 'gov.sg', 'org.sg', 'net.sg', 'com.hk', 'org.hk', 'gov.hk', 'edu.hk', 'net.hk',
-  'com.tw', 'org.tw', 'edu.tw', 'gov.tw', 'net.tw', 'com.ar', 'org.ar', 'gob.ar', 'net.ar', 'edu.ar',
-  'co.za', 'org.za', 'gov.za', 'ac.za', 'net.za', 'web.za', 'co.id', 'or.id', 'ac.id', 'go.id', 'web.id',
-  'co.il', 'org.il', 'ac.il', 'gov.il', 'net.il', 'muni.il', 'com.my', 'org.my', 'gov.my', 'edu.my', 'net.my',
-  'com.ph', 'org.ph', 'gov.ph', 'edu.ph', 'net.ph', 'com.vn', 'org.vn', 'gov.vn', 'edu.vn', 'net.vn',
-  'com.ua', 'org.ua', 'gov.ua', 'edu.ua', 'net.ua', 'in.ua', 'kiev.ua',
-  'com.pl', 'org.pl', 'net.pl', 'edu.pl', 'gov.pl', 'waw.pl', 'com.pt', 'org.pt', 'gov.pt', 'edu.pt',
-  'com.es', 'org.es', 'nom.es', 'gob.es', 'edu.es', 'com.gr', 'org.gr', 'gov.gr', 'edu.gr', 'net.gr',
-  'co.at', 'or.at', 'gv.at', 'ac.at', 'co.hu', 'org.hu', 'co.th', 'or.th', 'ac.th', 'go.th', 'in.th', 'net.th',
-  'com.co', 'org.co', 'net.co', 'edu.co', 'gov.co', 'com.pe', 'org.pe', 'gob.pe', 'edu.pe', 'com.ve', 'org.ve',
-  'com.uy', 'com.ec', 'com.gt', 'com.pa', 'com.do', 'com.py', 'com.bo', 'com.ni', 'com.sv', 'com.hn', 'co.cr', 'co.ve',
-  'com.eg', 'org.eg', 'gov.eg', 'edu.eg', 'com.sa', 'org.sa', 'gov.sa', 'edu.sa', 'com.pk', 'org.pk', 'gov.pk', 'edu.pk', 'net.pk',
-  'com.bd', 'org.bd', 'gov.bd', 'edu.bd', 'net.bd', 'com.ng', 'org.ng', 'gov.ng', 'edu.ng', 'com.gh',
-  'co.ke', 'or.ke', 'go.ke', 'ac.ke', 'co.tz', 'co.ug', 'co.zw', 'co.zm', 'co.bw', 'com.np', 'com.lk', 'com.kh', 'com.mm',
-  'com.kw', 'com.qa', 'com.lb', 'com.jo', 'com.om', 'com.bh', 'com.dz', 'com.tn', 'com.ma', 'co.ma', 'com.cy', 'com.mt',
-  // private suffixes, where unrelated people host sites: a cookie must never be
-  // set for the suffix itself, and two sites under it are different sites
-  'github.io', 'gitlab.io', 'herokuapp.com', 'vercel.app', 'netlify.app', 'pages.dev', 'workers.dev', 'web.app',
-  'firebaseapp.com', 'appspot.com', 'blogspot.com', 'azurewebsites.net', 'cloudfront.net', 'glitch.me', 'repl.co',
-  'replit.app', 'replit.dev', 'onrender.com', 'fly.dev', 'surge.sh', 'neocities.org', 'webflow.io', 'railway.app',
-  'deno.dev', 'ngrok.io', 'ngrok-free.app', 'trycloudflare.com', 'duckdns.org', 'ddns.net', 'cloudapp.net',
-  'azureedge.net', 'googleusercontent.com', 'bubbleapps.io', 'carrd.co', 'notion.site', 'codesandbox.io', 'csb.app',
-  'stackblitz.io', 'webcontainer.io', 'wixsite.com'
+  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk', 'com.au', 'net.au', 'org.au', 'edu.au',
+  'co.jp', 'or.jp', 'ne.jp', 'co.nz', 'org.nz', 'co.in', 'net.in', 'org.in', 'co.kr',
+  'com.br', 'com.cn', 'com.mx', 'com.tr', 'com.sg', 'com.hk', 'com.tw', 'com.ar',
+  'co.za', 'co.id', 'co.il', 'com.my', 'com.ph', 'com.vn', 'com.ua', 'com.pl'
 ]);
 
 function b64uEnc(str) {
@@ -618,14 +590,11 @@ function getSetCookies(headers) {
 }
 
 // Turn each upstream Set-Cookie into one relay Set-Cookie (set or expire).
-function storeSetCookies(jar, target, lines, persistMs) {
+function storeSetCookies(jar, target, lines) {
   const now = Date.now();
   for (const line of lines) {
     const c = parseSetCookie(line, target, now);
     if (!c) continue;
-    // Settings -> Privacy -> Keep sign-ins: a session cookie (no expiry) is kept
-    // for persistMs instead of until the browser closes.
-    if (persistMs && !c.exp && !c.del) c.exp = now + persistMs;
     const kind = c.httpOnly ? 'h' : 's';
     const nameK = jarCookieName(kind, c.key, c.path, c.name);
     const nameO = jarCookieName(kind === 'h' ? 's' : 'h', c.key, c.path, c.name);
@@ -1693,27 +1662,17 @@ function isBlockedTarget(hostname) {
   return false;
 }
 
-// Privacy and sign-in switches (Settings -> Privacy and sign-ins), kept in ONE
-// cookie as flags joined by "-": rtc (WebRTC protection), keep (keep sign-ins),
-// iso (isolate site storage).
-const PRIV_FLAGS = ['rtc', 'keep', 'iso'];
-function getPrivFlags(request) {
-  const out = { rtc: false, keep: false, iso: false };
-  try {
-    const raw = relayGetCookie(request, PRIV_COOKIE) || '';
-    for (const f of raw.split('-')) {
-      if (PRIV_FLAGS.indexOf(f) !== -1) out[f] = true;
-    }
-  } catch {
-    // none set
-  }
-  return out;
+function privCookieHeader(rtc) {
+  if (!rtc) return PRIV_COOKIE + '=; Path=/; Max-Age=0; Secure; SameSite=Lax; HttpOnly';
+  return PRIV_COOKIE + '=rtc; Path=/; Max-Age=31536000; Secure; SameSite=Lax; HttpOnly';
 }
 
-function privCookieHeader(flags) {
-  const on = PRIV_FLAGS.filter((f) => flags && flags[f]);
-  if (!on.length) return PRIV_COOKIE + '=; Path=/; Max-Age=0; Secure; SameSite=Lax; HttpOnly';
-  return PRIV_COOKIE + '=' + on.join('-') + '; Path=/; Max-Age=31536000; Secure; SameSite=Lax; HttpOnly';
+function getRtcBlock(request) {
+  try {
+    return relayGetCookie(request, PRIV_COOKIE) === 'rtc';
+  } catch {
+    return false;
+  }
 }
 
 // ---- Per-site browsing mode ---------------------------------------------------
@@ -1826,10 +1785,6 @@ function settingsPage(o) {
     cookies: 'Cookies cleared.',
     'rtc-on': 'WebRTC protection is on. Reload the pages you have open.',
     'rtc-off': 'WebRTC protection is off. Reload the pages you have open.',
-    'keep-on': 'Sign-ins are kept for 30 days. Sign in again on the sites you use.',
-    'keep-off': 'Sign-ins end when the browser closes again, for cookies set from now on.',
-    'iso-on': 'Site storage is isolated. Reload the pages you have open.',
-    'iso-off': 'Site storage is shared again. Reload the pages you have open.',
     'frame-set': 'Saved. Game frames now load from that hostname.',
     'frame-cleared': 'Saved. Game frames load from this hostname again.',
     'frame-invalid': 'That hostname does not work: it must be https and a different hostname under the same domain as this relay (for example play.' + (o.proxyHost || '').split('.').slice(-2).join('.') + ').'
@@ -1875,16 +1830,10 @@ function settingsPage(o) {
       '</section>';
   }
 
-  const priv = o.priv || {};
-  const privRow = (flag, title, text) =>
-    '<div class="row"><div><b>' + e(title) + '</b><div class="sub">' + e(text) + '</div></div>' +
-    form(flag + (priv[flag] ? '_off' : '_on'), {}, priv[flag] ? 'Turn off' : 'Turn on') + '</div>';
-  const privacySection = '<section><h2>Privacy and sign-ins</h2>' +
-    '<p>Three switches, each remembered in this browser and off by default. They apply to pages opened on this hostname.</p>' +
-    privRow('rtc', 'WebRTC protection', 'Forces WebRTC connections through a relay server, so a page cannot learn your real address through them. Calls and peer-to-peer games that bring no relay server may stop working.') +
-    privRow('keep', 'Keep sign-ins', 'A site\'s session cookies (the ones with no expiry, which normally end when the browser closes) are kept for 30 days, so you stay signed in after a restart.') +
-    privRow('iso', 'Isolate site storage', 'Gives each site its own localStorage, sessionStorage, IndexedDB and cache storage, so two sites that use the same key cannot read or overwrite each other. What a site saved before this was on stays out of its reach, so it may look signed out or lose saved state once.') +
-    '</section>';
+  const privacySection = '<section><h2>Privacy</h2>' +
+    '<p>A page can learn your real address through WebRTC, which the relay cannot hide on its own. With protection on, WebRTC connections are forced through a relay server, so they stop revealing your address; calls and peer-to-peer games that do not bring such a server may stop working. It applies to pages opened on this hostname.</p>' +
+    '<p class="state">WebRTC protection: ' + (o.rtcBlock ? 'on' : 'off') + '</p>' +
+    '<div class="actions">' + (o.rtcBlock ? form('rtc_off', {}, 'Turn off') : form('rtc_on', {}, 'Turn on')) + '</div></section>';
 
   const frameSection = '<section><h2>Game frames</h2>' +
     '<p>Some games refuse to run unless a portal embeds them (“can be played exclusively on CrazyGames.com”): they read the address of the top window, and under the relay the portal and the game share one origin, so that check fails. Give the relay a second hostname under the same domain — add it as a <b>custom domain</b> of this Worker in the Cloudflare dashboard — and game frames are loaded from it, which makes the portal and the game different origins, as on the real site.</p>' +
@@ -2510,12 +2459,9 @@ async function handleRelayRequest(request, env, ctx) {
             // A stale real-path context would otherwise keep re-routing bare paths.
             headers.append('Set-Cookie', CTX_COOKIE + '=; Path=/; Max-Age=0; Secure; SameSite=Lax');
           }
-        } else if (/^(rtc|keep|iso)_(on|off)$/.test(action)) {
-          const pm = /^(rtc|keep|iso)_(on|off)$/.exec(action);
-          const cur = getPrivFlags(request);
-          cur[pm[1]] = pm[2] === 'on';
-          headers.append('Set-Cookie', privCookieHeader(cur));
-          note = pm[1] + '-' + pm[2];
+        } else if (action === 'rtc_on' || action === 'rtc_off') {
+          headers.append('Set-Cookie', privCookieHeader(action === 'rtc_on'));
+          note = action === 'rtc_on' ? 'rtc-on' : 'rtc-off';
         } else if (action === 'frame_set' || action === 'frame_clear') {
           if (action === 'frame_clear') {
             headers.append('Set-Cookie', frameCookieHeader(null));
@@ -2550,7 +2496,7 @@ async function handleRelayRequest(request, env, ctx) {
         debugOn: /(?:^|;\s*)__relay_debug=1/.test(request.headers.get('Cookie') || ''),
         realHosts: rpHosts,
         frameOrigin: getFrameOrigin(request, proxyOrigin),
-        priv: getPrivFlags(request),
+        rtcBlock: getRtcBlock(request),
         prefill: normalizeSiteInput(url.searchParams.get('site')),
         note: url.searchParams.get('note') || '',
         jar: COOKIE_JAR ? loadJar(request) : null
@@ -2892,7 +2838,6 @@ async function handleRelayRequest(request, env, ctx) {
     }
 
     const upstreamHref = stripProxyFromQuery(parsedTarget, proxyOrigin, pageCtx.origin);
-    const privFlags = getPrivFlags(request);
     // Long-polling (socket.io's polling transport, Engine.IO, SSE-like endpoints)
     // holds a response for 25-30 s before sending headers, which the 20 s header
     // timeout read as a dead target and turned into a 502: "connection error".
@@ -2909,25 +2854,12 @@ async function handleRelayRequest(request, env, ctx) {
         // behave naturally - and each hop passes through the Worker again, so
         // cookies set on a redirect are stored before the next hop is made.
         upstream = await fetchUpstream(upstreamHref, Object.assign({}, upstreamInit, { redirect: 'manual' }), upstreamTimeout, { retry5xx: gameCtx && GAME_RETRY && !GAME_AD_HOSTS.test(parsedTarget.hostname) });
-        storeSetCookies(jar, new URL(upstreamHref), getSetCookies(upstream.headers), privFlags.keep ? 30 * 24 * 3600 * 1000 : 0);
+        storeSetCookies(jar, new URL(upstreamHref), getSetCookies(upstream.headers));
       } else {
         upstream = await fetchUpstream(upstreamHref, upstreamInit, upstreamTimeout, { retry5xx: gameCtx && GAME_RETRY && !GAME_AD_HOSTS.test(parsedTarget.hostname) });
       }
     } catch (error) {
       return errorResponse(proxyOrigin, 502, "Couldn't reach that address", 'The request to the target failed before any response came back.', (derivedHostHint(parsedTarget.hostname, proxyOrigin) + ' ' + error.message).trim(), parsedTarget.href);
-    }
-
-    // Clear-Site-Data: a logout that asks the browser to clear the site's cookies.
-    // The header itself is stripped below (it must never act on the relay's own
-    // storage), so the cookie part is honoured against the JAR instead.
-    if (jarOn && /"(cookies|\*)"/i.test(upstream.headers.get('Clear-Site-Data') || '')) {
-      const csdHost = parsedTarget.hostname.toLowerCase();
-      for (const [name, meta] of Array.from(jar.raw)) {
-        if (csdHost === meta.key || csdHost.endsWith('.' + meta.key)) {
-          jar.ops.push(jarExpireHeader(name));
-          jar.raw.delete(name);
-        }
-      }
     }
 
     // The FINAL url after any redirects fetch() followed. Captured BEFORE any
@@ -3003,11 +2935,7 @@ async function handleRelayRequest(request, env, ctx) {
     // text/html below, which real-world XHTML renders under fine; the one
     // known hazard is XHTML's legal self-closing external <script/>,
     // which HTML parsing treats as an unclosed <script> tag.
-    // A response the server marks as a download (Content-Disposition: attachment)
-    // is a file, even when its type is text/html: it must reach the browser byte
-    // for byte, not with the relay's scripts injected into it.
-    const isAttachment = /^\s*attachment/i.test(upstream.headers.get('content-disposition') || '');
-    const isHtml = !nullBodyStatus && !isAttachment &&
+    const isHtml = !nullBodyStatus &&
       (contentType.includes('text/html') || contentType.includes('application/xhtml+xml'));
 
     // Non-HTML: stream through untouched, but for static asset types (JS,
@@ -3028,30 +2956,6 @@ async function handleRelayRequest(request, env, ctx) {
       // general "rewrite URLs in any response" rule, which would risk
       // corrupting arbitrary application code that uses URL-like strings
       // for its own internal logic.
-      // HLS / DASH manifests (see rewriteHlsPlaylist). Live playlists are never
-      // cached (noEdgeCache above); a body too large to be a manifest is handed
-      // back untouched.
-      if (request.method === 'GET' && upstream.status === 200 && !nullBodyStatus &&
-          (isHlsPlaylist(contentType, parsedTarget.pathname) || isDashManifest(contentType, parsedTarget.pathname)) &&
-          parseInt(upstream.headers.get('content-length') || '0', 10) < MANIFEST_MAX_BYTES) {
-        const manifestText = await upstream.text();
-        let manifestOut = manifestText;
-        if (manifestText.length < MANIFEST_MAX_BYTES) {
-          const manifestBase = upstreamFinalUrl || parsedTarget.href;
-          manifestOut = isHlsPlaylist(contentType, parsedTarget.pathname)
-            ? rewriteHlsPlaylist(manifestText, manifestBase, proxyOrigin)
-            : rewriteDashManifest(manifestText, manifestBase, proxyOrigin);
-        }
-        const manifestHeaders = new Headers(upstream.headers);
-        withJarCookies(manifestHeaders, jarSetCookies);
-        // .text() already decoded the body: stale length / encoding claims would
-        // truncate or fail it in the browser.
-        manifestHeaders.delete('Content-Encoding');
-        manifestHeaders.delete('Content-Length');
-        manifestHeaders.delete('Transfer-Encoding');
-        return new Response(manifestOut, { status: 200, headers: manifestHeaders });
-      }
-
       if (SEARCH_DATA_HOSTS.has(parsedTarget.hostname) && !nullBodyStatus) {
         const text = await upstream.text();
         const rewritten = rewriteEmbeddedUrls(text, upstreamFinalUrl || parsedTarget.href, proxyOrigin);
@@ -3090,9 +2994,7 @@ async function handleRelayRequest(request, env, ctx) {
           headers.set('Cache-Control', 'public, max-age=3600');
           upstreamForbids = false;
         } else if (!upstreamForbids && !maxAgeMatch) {
-          // stale-while-revalidate: a visit after the day still paints from cache while
-          // the browser refreshes the file in the background.
-          headers.set('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+          headers.set('Cache-Control', 'public, max-age=86400');
         }
         withJarCookies(headers, jarSetCookies);
         const asset = new Response(upstream.body, {
@@ -3191,18 +3093,12 @@ async function handleRelayRequest(request, env, ctx) {
       .on('meta[http-equiv]', new MetaRefreshRewriter(baseUrl, proxyOrigin))
       .on('meta[http-equiv]', new MetaCspRemover())
       .on('head', new BaseTagInjector(proxiedBase))
-      .on('head', new ScriptInjector(proxyOrigin, spoofPath, gameCtx, injected.ver, leanFrame, privFlags));
+      .on('head', new ScriptInjector(proxyOrigin, spoofPath, gameCtx, injected.ver, leanFrame, getRtcBlock(request)));
 
     const transformed = rewriter.transform(upstream);
 
-    // HTMLRewriter passes the bytes it does not touch through unchanged, so the
-    // document stays in its own encoding. Labelling every page utf-8 turned
-    // Shift_JIS, GBK, windows-1251... pages into mojibake. Keep the charset the
-    // server declared; without one, say nothing and let the browser read the
-    // page's own <meta charset>.
-    const charsetMatch = /charset\s*=\s*"?([^;"\s]+)/i.exec(contentType);
     const htmlHeaders = new Headers({
-      'Content-Type': charsetMatch ? 'text/html; charset=' + charsetMatch[1] : 'text/html',
+      'Content-Type': 'text/html; charset=utf-8',
       // A page built with the visitor's cookies must not be stored by shared caches.
       'Cache-Control': (cookieHeader || jarSetCookies.length) ? 'private, no-cache' : 'public, max-age=60'
     });
@@ -3580,51 +3476,6 @@ function rewriteEmbeddedUrls(text, baseUrl, proxyOrigin) {
   });
 }
 
-// ---- Streaming manifests ------------------------------------------------------
-// An HLS playlist (.m3u8) or DASH manifest (.mpd) lists the media files a player
-// then fetches itself. Relative entries resolve against the (proxied) manifest URL
-// and need nothing, but an ABSOLUTE entry would be fetched directly from the CDN,
-// around the relay (showing the visitor's address, and failing hotlink checks that
-// expect the page's Referer), and a ROOT-relative one would escape to the relay's
-// root. Those are rewritten to the relay; plain relative ones are left alone.
-const MANIFEST_MAX_BYTES = 2 * 1024 * 1024;
-
-function isHlsPlaylist(contentType, pathname) {
-  return /mpegurl/i.test(contentType) || /\.m3u8$/i.test(pathname);
-}
-
-function isDashManifest(contentType, pathname) {
-  return /dash\+xml/i.test(contentType) || /\.mpd$/i.test(pathname);
-}
-
-function proxifyMediaUri(u, baseUrl, proxyOrigin) {
-  const t = String(u).trim();
-  if (!t || /^(data|blob):/i.test(t) || t.charAt(0) === '#') return u;
-  if (!/^(https?:)?\/\//i.test(t) && t.charAt(0) !== '/') return u;
-  if (t.indexOf(proxyOrigin + '/') === 0) return u;
-  try {
-    return proxyOrigin + '/' + new URL(t, baseUrl).href;
-  } catch {
-    return u;
-  }
-}
-
-function rewriteHlsPlaylist(text, baseUrl, proxyOrigin) {
-  return text.split(/\r?\n/).map((line) => {
-    if (!line) return line;
-    if (line.charAt(0) === '#') {
-      return line.replace(/URI="([^"]*)"/g, (m, u) => 'URI="' + proxifyMediaUri(u, baseUrl, proxyOrigin) + '"');
-    }
-    return proxifyMediaUri(line, baseUrl, proxyOrigin);
-  }).join('\n');
-}
-
-function rewriteDashManifest(text, baseUrl, proxyOrigin) {
-  return text
-    .replace(/(<BaseURL\b[^>]*>)([^<]*)(<\/BaseURL>)/g, (m, open, u, close) => open + proxifyMediaUri(u, baseUrl, proxyOrigin) + close)
-    .replace(/\b(media|initialization|sourceURL|index)="([^"]*)"/g, (m, attr, u) => attr + '="' + proxifyMediaUri(u, baseUrl, proxyOrigin) + '"');
-}
-
 // Major search engines wrap result links in a server-side click-tracking
 // redirect that serves an interstitial page whose own JS then navigates
 // onward — commonly via a direct, unpatchable location assignment straight
@@ -3636,7 +3487,7 @@ function rewriteDashManifest(text, baseUrl, proxyOrigin) {
 // URL unchanged if no known pattern matches — never breaks a link.
 // Cheap pre-check: a tracking redirect has /ck/a, /url or /l as a whole path
 // segment, so anything else (nearly every link) skips the URL parse below.
-const TRACKING_HINT = /(^|\/)ck\/a(\?|#|$)|(^|\/)url(\?|#|$)|(^|\/)l(\/|\?|#|$)|\/RU=/i;
+const TRACKING_HINT = /(^|\/)ck\/a(\?|#|$)|(^|\/)url(\?|#|$)|(^|\/)l(\/|\?|#|$)/i;
 
 function decodeTrackingRedirect(rawValue, baseUrl) {
   if (!TRACKING_HINT.test(rawValue)) return null;
@@ -3665,22 +3516,8 @@ function decodeTrackingRedirect(rawValue, baseUrl) {
 
   // Google: /url?q=<url-encoded destination>
   if (/^\/url$/i.test(u.pathname) && /(^|\.)google\.[a-z.]+$/i.test(u.hostname)) {
-    const q = u.searchParams.get('q') || u.searchParams.get('url');
+    const q = u.searchParams.get('q');
     if (q && /^https?:\/\//i.test(q)) return q;
-    return null;
-  }
-
-  // Yahoo: r.search.yahoo.com/.../RU=<url-encoded destination>/RK=...
-  if (/(^|\.)search\.yahoo\.com$/i.test(u.hostname)) {
-    const ym = /\/RU=([^\/]+)/.exec(u.pathname);
-    if (ym) {
-      try {
-        const yd = decodeURIComponent(ym[1]);
-        if (/^https?:\/\//i.test(yd)) return yd;
-      } catch {
-        // fall through
-      }
-    }
     return null;
   }
 
@@ -3909,18 +3746,17 @@ async function getInjected(proxyOrigin, cookieJar) {
 // cacheable file. If an inline script is ever blocked the file falls back to
 // normal mode, so a failure here costs a feature, never the page.
 class ScriptInjector {
-  constructor(proxyOrigin, realPath, gameMode, ver, lean, flags) {
+  constructor(proxyOrigin, realPath, gameMode, ver, lean, rtc) {
     this.proxyOrigin = proxyOrigin;
     this.realPath = realPath || '';
     this.gameMode = !!gameMode;
     this.ver = ver;
     this.lean = !!lean;
-    this.rtc = !!(flags && flags.rtc);
-    this.iso = !!(flags && flags.iso);
+    this.rtc = !!rtc;
   }
   element(el) {
     const cfg = 'window.__relayCfg={p:' + JSON.stringify(this.realPath).replace(/</g, '\\u003c') +
-      ',g:' + (this.gameMode ? 1 : 0) + ',l:' + (this.lean ? 1 : 0) + ',r:' + (this.rtc ? 1 : 0) + ',i:' + (this.iso ? 1 : 0) + '};';
+      ',g:' + (this.gameMode ? 1 : 0) + ',l:' + (this.lean ? 1 : 0) + ',r:' + (this.rtc ? 1 : 0) + '};';
     const src = this.proxyOrigin + INJECT_PATH + '?v=' + this.ver;
     el.prepend('<script>' + cfg + '</script><script src="' + escapeHtml(src) + '"></script>', { html: true });
   }
@@ -3945,8 +3781,6 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       var relayLean = !!(self.__relayCfg && self.__relayCfg.l);
       // WebRTC protection (Settings -> Privacy): see the RTCPeerConnection patch.
       var relayRtc = !!(self.__relayCfg && self.__relayCfg.r);
-      // Storage isolation (Settings -> Privacy and sign-ins).
-      var relayIso = !!(self.__relayCfg && self.__relayCfg.i);
       // Cookie jar (see COOKIE_JAR on the server): document.cookie is replaced
       // by a shim over the jar cookies. Everything in this script that needs
       // the page's REAL cookie string (the relay's own debug and context
@@ -4013,135 +3847,6 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           relaySpoofPath = '';
         }
       }
-
-      // --- Storage isolation (opt-in) --------------------------------------
-      // Every proxied site lives on the relay's origin, so they all share one
-      // localStorage, sessionStorage, IndexedDB and cache storage: two sites that use
-      // the same key overwrite each other, and one can read another's tokens. With
-      // isolation on, each real origin gets its own namespace, applied by prefixing
-      // keys and database / cache names. Storage the relay itself needs (its debug
-      // log, the navigation guard counter) is read through relayNativeSession,
-      // captured BEFORE the replacement.
-      var relayNativeSession = null;
-      try { relayNativeSession = window.sessionStorage; } catch (e) {}
-      try {
-        if (relayIso) {
-          var relayNsOrigin = '';
-          try { relayNsOrigin = new URL(realBase()).origin; } catch (e) {}
-          if (relayNsOrigin) {
-            var relayNs = '__rs:' + relayNsOrigin + '|';
-            var relayWrapStorage = function(nat) {
-              var keysOf = function() {
-                var out = [];
-                for (var i = 0; i < nat.length; i++) {
-                  var k = nat.key(i);
-                  if (k !== null && k.indexOf(relayNs) === 0) out.push(k.slice(relayNs.length));
-                }
-                return out;
-              };
-              var api = {
-                getItem: function(k) { return nat.getItem(relayNs + k); },
-                setItem: function(k, v) { nat.setItem(relayNs + k, v); },
-                removeItem: function(k) { nat.removeItem(relayNs + k); },
-                clear: function() { var ks = keysOf(); for (var i = 0; i < ks.length; i++) nat.removeItem(relayNs + ks[i]); },
-                key: function(i) { var ks = keysOf(); return i >= 0 && i < ks.length ? ks[i] : null; }
-              };
-              return new Proxy(api, {
-                get: function(t, p) {
-                  if (p === 'length') return keysOf().length;
-                  if (typeof p === 'symbol') return p === Symbol.toStringTag ? 'Storage' : undefined;
-                  if (Object.prototype.hasOwnProperty.call(api, p)) return api[p];
-                  var v = nat.getItem(relayNs + p);
-                  return v === null ? undefined : v;
-                },
-                set: function(t, p, v) { if (typeof p === 'string') nat.setItem(relayNs + p, v); return true; },
-                deleteProperty: function(t, p) { if (typeof p === 'string') nat.removeItem(relayNs + p); return true; },
-                has: function(t, p) {
-                  return typeof p === 'string' && (p === 'length' || Object.prototype.hasOwnProperty.call(api, p) || nat.getItem(relayNs + p) !== null);
-                },
-                ownKeys: function() { return keysOf(); },
-                getOwnPropertyDescriptor: function(t, p) {
-                  if (typeof p !== 'string') return undefined;
-                  var v = nat.getItem(relayNs + p);
-                  return v === null ? undefined : { value: v, writable: true, enumerable: true, configurable: true };
-                }
-              });
-            };
-            ['localStorage', 'sessionStorage'].forEach(function(name) {
-              try {
-                var nat = window[name];
-                var wrapped = relayWrapStorage(nat);
-                Object.defineProperty(window, name, { get: function() { return wrapped; }, configurable: true, enumerable: true });
-              } catch (e) {}
-            });
-            var relayDbName = function(n) { return relayNs + String(n); };
-            var relayDbStrip = function(n) { return typeof n === 'string' && n.indexOf(relayNs) === 0 ? n.slice(relayNs.length) : n; };
-            try {
-              if (window.IDBFactory && IDBFactory.prototype) {
-                var idbOpen = IDBFactory.prototype.open;
-                var idbDelete = IDBFactory.prototype.deleteDatabase;
-                var idbList = IDBFactory.prototype.databases;
-                IDBFactory.prototype.open = function(name) {
-                  var a = Array.prototype.slice.call(arguments);
-                  a[0] = relayDbName(name);
-                  return idbOpen.apply(this, a);
-                };
-                IDBFactory.prototype.deleteDatabase = function(name) {
-                  var a = Array.prototype.slice.call(arguments);
-                  a[0] = relayDbName(name);
-                  return idbDelete.apply(this, a);
-                };
-                if (idbList) {
-                  IDBFactory.prototype.databases = function() {
-                    return idbList.call(this).then(function(list) {
-                      return list.filter(function(d) { return d && typeof d.name === 'string' && d.name.indexOf(relayNs) === 0; })
-                        .map(function(d) { return { name: relayDbStrip(d.name), version: d.version }; });
-                    });
-                  };
-                }
-              }
-              if (window.IDBDatabase && IDBDatabase.prototype) {
-                var dbNameDesc = Object.getOwnPropertyDescriptor(IDBDatabase.prototype, 'name');
-                if (dbNameDesc && dbNameDesc.get) {
-                  Object.defineProperty(IDBDatabase.prototype, 'name', {
-                    get: function() { return relayDbStrip(dbNameDesc.get.call(this)); },
-                    configurable: true,
-                    enumerable: dbNameDesc.enumerable
-                  });
-                }
-              }
-            } catch (e) {}
-            try {
-              if (window.CacheStorage && CacheStorage.prototype) {
-                ['open', 'has', 'delete'].forEach(function(m) {
-                  var orig = CacheStorage.prototype[m];
-                  if (typeof orig !== 'function') return;
-                  CacheStorage.prototype[m] = function(name) {
-                    var a = Array.prototype.slice.call(arguments);
-                    a[0] = relayDbName(name);
-                    return orig.apply(this, a);
-                  };
-                });
-                var cacheKeys = CacheStorage.prototype.keys;
-                if (cacheKeys) {
-                  CacheStorage.prototype.keys = function() {
-                    return cacheKeys.call(this).then(function(ks) {
-                      return ks.filter(function(k) { return k.indexOf(relayNs) === 0; }).map(relayDbStrip);
-                    });
-                  };
-                }
-                var cacheMatch = CacheStorage.prototype.match;
-                if (cacheMatch) {
-                  CacheStorage.prototype.match = function(req, opts) {
-                    if (opts && opts.cacheName) opts = Object.assign({}, opts, { cacheName: relayDbName(opts.cacheName) });
-                    return cacheMatch.call(this, req, opts);
-                  };
-                }
-              }
-            } catch (e) {}
-          }
-        }
-      } catch (e) {}
 
       // --- Cookie jar: document.cookie shim --------------------------------
       // The Worker keeps each site's cookies as one relay cookie per upstream
@@ -4304,18 +4009,8 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           return null;
         }
         if (/^\\/url$/i.test(u.pathname) && /(^|\\.)google\\.[a-z.]+$/i.test(u.hostname)) {
-          var q = u.searchParams.get('q') || u.searchParams.get('url');
+          var q = u.searchParams.get('q');
           if (q && /^https?:\\/\\//i.test(q)) return q;
-          return null;
-        }
-        if (/(^|\\.)search\\.yahoo\\.com$/i.test(u.hostname)) {
-          var ym = /\\/RU=([^\\/]+)/.exec(u.pathname);
-          if (ym) {
-            try {
-              var yd = decodeURIComponent(ym[1]);
-              if (/^https?:\\/\\//i.test(yd)) return yd;
-            } catch (e) {}
-          }
           return null;
         }
         if (/^\\/l\\/?$/i.test(u.pathname) && /(^|\\.)duckduckgo\\.com$/i.test(u.hostname)) {
@@ -4345,7 +4040,7 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       var RELAY_HOST = '';
       try { RELAY_HOST = new URL(proxyOrigin).host; } catch (e) {}
       function relayIsCaptchaUrl(u) {
-        return /^https?:\\/\\/([^\\/?#]*\\.)?(hcaptcha\\.com|challenges\\.cloudflare\\.com|arkoselabs\\.com|funcaptcha\\.com|geetest\\.com|geevisit\\.com|friendlycaptcha\\.com|captcha-delivery\\.com|datadome\\.co|recaptcha\\.net|mtcaptcha\\.com|smartcaptcha\\.yandexcloud\\.net|captcha-api\\.yandex\\.ru|captcha\\.qq\\.com|qcloud\\.com|procaptcha\\.io|lemincaptcha\\.com|px-cloud\\.net|perimeterx\\.net|px-cdn\\.net)(\\/|\\?|#|$)/i.test(u) ||
+        return /^https?:\\/\\/([^\\/?#]*\\.)?(hcaptcha\\.com|challenges\\.cloudflare\\.com|arkoselabs\\.com|funcaptcha\\.com|geetest\\.com|geevisit\\.com|friendlycaptcha\\.com|captcha-delivery\\.com|datadome\\.co|recaptcha\\.net)(\\/|\\?|#|$)/i.test(u) ||
           /^https?:\\/\\/(www\\.)?(google\\.com|gstatic\\.com)\\/recaptcha\\//i.test(u);
       }
       function relayFixCaptchaUrl(abs) {
@@ -4380,25 +4075,7 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
         }
       }
 
-      // toProxied is called for every URL an app writes (images, scripts, XHRs): a
-      // small memo keyed on the raw string, dropped whenever the document's base
-      // changes, saves re-parsing the same strings.
-      var relayProxMemo = new Map();
-      var relayProxBase = '';
       function toProxied(raw) {
-        if (typeof raw !== 'string' || !raw) return raw;
-        var b = document.baseURI;
-        if (b !== relayProxBase) { relayProxMemo.clear(); relayProxBase = b; }
-        var hit = relayProxMemo.get(raw);
-        if (hit !== undefined) return hit;
-        var out = toProxiedUncached(raw);
-        if (raw.length < 600) {
-          if (relayProxMemo.size >= 2000) relayProxMemo.clear();
-          relayProxMemo.set(raw, out);
-        }
-        return out;
-      }
-      function toProxiedUncached(raw) {
         try {
           if (typeof raw !== 'string' || !raw) return raw;
           if (/^(data|blob|javascript):/i.test(raw)) return raw;
@@ -4572,13 +4249,13 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       var RELAY_LOG_NO_LINK = RELAY_DEBUG;
       var __relayHist = [];
       if (RELAY_DEBUG) {
-        try { __relayHist = JSON.parse(relayNativeSession.getItem('__relay_hist') || '[]'); } catch (e) { __relayHist = []; }
+        try { __relayHist = JSON.parse(sessionStorage.getItem('__relay_hist') || '[]'); } catch (e) { __relayHist = []; }
       }
       function relayHistPush(entry) {
         try {
           __relayHist.unshift(entry);
           if (__relayHist.length > 60) __relayHist.length = 60;
-          relayNativeSession.setItem('__relay_hist', JSON.stringify(__relayHist));
+          sessionStorage.setItem('__relay_hist', JSON.stringify(__relayHist));
         } catch (e) {}
       }
       function relayRows() { return RELAY_DEBUG ? __relayHist : __relayFailures; }
@@ -5117,17 +4794,6 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
                 relayLogFailure('WS', realTarget, e.code, e.reason || 'closed unexpectedly');
               }
             });
-            // Debug mode: how long the socket lived and how much it carried, which is
-            // what separates "never connected" from "dropped after a minute".
-            if (RELAY_DEBUG) {
-              var wsT0 = Date.now();
-              var wsCount = 0;
-              sock.addEventListener('open', function() { relayLogFailure('WS', realTarget, 'OPEN', 'connected'); });
-              sock.addEventListener('message', function() { wsCount++; });
-              sock.addEventListener('close', function(e) {
-                relayLogFailure('WS', realTarget, 'CLOSE ' + e.code, Math.round((Date.now() - wsT0) / 1000) + ' s, ' + wsCount + ' messages' + (e.reason ? ', ' + e.reason : ''));
-              });
-            }
             return sock;
           };
           PatchedWebSocket.prototype = OrigWebSocket.prototype;
@@ -5339,30 +5005,7 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
             get: function() {
               var o = relayMeDesc.get.call(this);
               try {
-                if (o !== proxyOrigin) {
-                  // A message from a page or frame on the relay's OTHER hostname (see
-                  // Game frames in Settings): the sender's real origin comes from the
-                  // iframe that holds it, or from our own referrer when the sender is
-                  // the page that embeds us.
-                  try {
-                    var s0 = this.source;
-                    if (s0 && s0 !== window) {
-                      var frs0 = document.querySelectorAll('iframe');
-                      for (var f0 = 0; f0 < frs0.length; f0++) {
-                        if (frs0[f0].contentWindow === s0) {
-                          var m0 = /^https?:\\/\\/[^\\/]+\\/(https?:\\/\\/[^\\/]+)/i.exec(relayNativeGetAttr.call(frs0[f0], 'src') || '');
-                          if (m0) return new URL(m0[1]).origin;
-                        }
-                      }
-                    }
-                    if (relayRefDesc && relayRefDesc.get) {
-                      var r0 = relayRefDesc.get.call(document) || '';
-                      var m1 = /^https?:\\/\\/[^\\/]+\\/(https?:\\/\\/[^\\/]+)/i.exec(r0);
-                      if (m1 && r0.indexOf(o + '/') === 0) return new URL(m1[1]).origin;
-                    }
-                  } catch (e0) {}
-                  return o;
-                }
+                if (o !== proxyOrigin) return o;
                 var src = this.source;
                 if (!src || src === window) return o;
                 var b = src.document && src.document.baseURI;
@@ -5462,10 +5105,10 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
           var relayGuardCount = function() {
             var now = Date.now();
             var list = [];
-            try { list = JSON.parse(relayNativeSession.getItem('__relay_ng') || '[]'); } catch (x) { list = []; }
+            try { list = JSON.parse(sessionStorage.getItem('__relay_ng') || '[]'); } catch (x) { list = []; }
             list = list.filter(function(t) { return now - t < 10000; });
             list.push(now);
-            try { relayNativeSession.setItem('__relay_ng', JSON.stringify(list)); } catch (x) {}
+            try { sessionStorage.setItem('__relay_ng', JSON.stringify(list)); } catch (x) {}
             return list.length;
           };
           window.navigation.addEventListener('navigate', function(e) {
