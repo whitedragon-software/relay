@@ -12,6 +12,7 @@ https://relay.<username>.workers.dev/https://example.com/page?x=1
 - `wrangler.jsonc`: deploy config — Worker name `relay`, entry point `_worker.js`.
 - `README.md`: this file.
 - `CHANGELOG.md`: what changed in each version.
+- `CHECKLIST.md`: the full tiered test checklist, from ordinary sites to complex ones.
 - `archive/`: previous versions of the worker, kept for reference.
 
 ---
@@ -108,10 +109,13 @@ form post that redirects back with a short confirmation.
   (`localStorage`, the same key the homepage always used).
 - **Browsing mode** — which sites open in original mode (the default for every
   site) and which in real-path mode; see below.
-- **Privacy** — **WebRTC protection**: forces WebRTC connections through a relay
-  server so a page cannot learn your real address through them (see
-  *Limitations*). Off by default; it can stop calls and peer-to-peer games that
-  bring no relay server.
+- **Privacy and sign-ins** — three switches, each off by default and remembered in
+  one `__relay_priv` cookie: **WebRTC protection** (forces WebRTC through a relay
+  server so a page cannot learn your real address; it can stop calls and
+  peer-to-peer games that bring no relay server), **Keep sign-ins** (a site's session
+  cookies, which normally end when the browser closes, are kept for 30 days) and
+  **Isolate site storage** (each site gets its own `localStorage`, `sessionStorage`,
+  IndexedDB and cache storage; see *Storage isolation*).
 - **Game frames** — an optional second hostname for game frames; see *Game
   frames on their own hostname* below. Empty (off) by default.
 - **Debug bar** — shows the state of debug mode and turns it on or off. On, the
@@ -318,6 +322,31 @@ CSS `url()`) works inside files the relay never parses.
   `X-Forwarded-For`, `True-Client-IP`, `X-Real-IP`, `Forwarded`, `Via`,
   `CDN-Loop` and the `cf-` geo headers (city, region, postal code, timezone,
   latitude, longitude and so on) are all dropped.
+- **Streaming manifests.** An HLS playlist (`.m3u8`) or DASH manifest (`.mpd`) is
+  rewritten so the media files it lists are fetched through the relay: absolute,
+  protocol-relative and root-relative entries (segment lines, `URI="…"` attributes,
+  DASH `BaseURL`, `media`, `initialization`) are rewritten; plain relative ones are
+  left alone because they already resolve against the proxied manifest. Only a
+  `GET` answered `200` with a body under 2 MB is rewritten; live playlists are never
+  cached. Without this a player fetched absolute segments straight from the CDN,
+  around the relay.
+- **Downloads and encodings.** A response with `Content-Disposition: attachment` is
+  passed through byte for byte, even when it is `text/html`. A page keeps its
+  declared charset (`HTMLRewriter` leaves untouched bytes as they are, so labelling
+  every page `utf-8` garbled Shift_JIS, GBK and windows-1251 pages); with no declared
+  charset the `Content-Type` carries none and the browser reads the page's `<meta
+  charset>`. Large downloads stream, `Range` and `If-Range` are forwarded, and a
+  `206` passes through with its `Content-Range`.
+- **Search-result links.** The tracking-redirect decoder (server and injected
+  script) resolves Google (`/url?q=` and `/url?url=`), Bing (`/ck/a`), DuckDuckGo
+  (`/l/?uddg=`) and Yahoo (`r.search.yahoo.com/…/RU=<destination>/RK=…`) links to
+  their target, so a result opens directly.
+- **`Clear-Site-Data`.** The header is never forwarded to the relay's origin, but a
+  response carrying `"cookies"` or `"*"` (the usual logout) expires that site's
+  cookies in the jar. The cookie jar's suffix list covers about 330 country
+  registries and private suffixes (`github.io`, `herokuapp.com`, `vercel.app`,
+  `pages.dev`, `workers.dev`, `blogspot.com`…), so a cookie is never filed for such a
+  suffix and two sites under one are different sites for `SameSite`.
 - **Refused targets.** Private, loopback, link-local (cloud metadata),
   carrier-grade NAT, multicast and reserved IPv4 ranges, their IPv6 equivalents
   and local-only names (`localhost`, `.local`, `.internal`, `.localdomain`, `.lan`,
@@ -515,7 +544,15 @@ covered by an ancestor added in the same batch and the diagnostic stale-link
 sweep waits for idle time. Optional, off by default: `BLOCKED_HOSTS` answers
 analytics and ad hosts with an empty 204 instead of fetching them (each is a
 full Worker round trip) — blocking can break pages that expect those scripts, so
-it is a switch, not a default.
+it is a switch, not a default. Static files also carry
+`stale-while-revalidate=604800` next to their one-day cache, and the injected script
+memoises its URL rewriting. Two things outside the code are worth trying if the
+relay feels slow: **Smart Placement** (`"placement": { "mode": "smart" }` in
+`wrangler.jsonc`) runs the Worker near the sites it talks to, which helps
+many-request pages and games whose servers are far from you but can hurt when they
+are near; and a second hostname for game frames (see *Game frames on their own
+hostname*), which separates a game's traffic. Measure with a page you use before
+keeping either.
 
 **Cookie jar.** The Worker has no storage, so each visitor's browser keeps its
 own jar, as cookies on the relay's origin — **one relay cookie per upstream
@@ -531,14 +568,30 @@ to that race. On every request the Worker turns the cookies that match the
 target (host-only vs. `Domain`, `Path`, `Secure`, expiry, `__Secure-`/`__Host-`
 prefixes, and `SameSite` judged against the page's site) into an ordinary
 `Cookie` header, and turns each upstream `Set-Cookie` into one relay
-`Set-Cookie` (set or expire). Limits: about 3.8 KB per cookie, 6 KB per site
-and 10 KB in total; past that the largest untouched sites are expired so the
+`Set-Cookie` (set or expire). Limits: about 3.8 KB per cookie, 8 KB per site
+and 14 KB in total; past that the largest untouched sites are expired so the
 browser's `Cookie` header can never grow past what Cloudflare accepts. The
 relay's own cookies live beside the jar and are not part of it: `__relay_pwd`
 (login), `__relay_rp` (the real-path site list), `__relay_ctx` (real-path
 context) and `__relay_debug`. To turn the jar off, set `COOKIE_JAR` to `false` at
 the top of `_worker.js` (redirects and caching then behave as in v0.10.0; POST
 forms still go through the relay, without cookies).
+
+**Storage isolation (opt-in).** Every proxied site lives on the relay's origin, so
+by default they all share one `localStorage`, `sessionStorage`, IndexedDB and cache
+storage: two sites that use the same key overwrite each other (two games with the
+same save key), and a script on one site can read another's tokens. Settings →
+Privacy and sign-ins → **Isolate site storage** gives each real origin its own
+namespace. `localStorage` and `sessionStorage` become a view over keys prefixed with
+the origin (`getItem`, `setItem`, `removeItem`, `clear`, `key`, `length`, property
+access, `Object.keys` and `JSON.stringify` work); IndexedDB database names and cache
+names are prefixed the same way, and `databases()`, `keys()` and `db.name` strip the
+prefix again. It is off by default because it cannot be tested against every site:
+what a site saved before the switch stays out of its reach (it may look signed out or
+lose saved state once), `Storage.prototype` methods called on `localStorage` itself
+no longer apply, and `storage` events are unchanged. The relay's own use of
+`sessionStorage` (the debug log, the navigation-guard counter) goes through the real
+one.
 
 **Captchas and embedded widgets.** A captcha checks which site is hosting it:
 its widget URL carries that site's name (hCaptcha: `host=` in the fragment or
@@ -724,6 +777,10 @@ the target.
 
 ## Quick test checklist
 
+The full, tiered checklist — ordinary sites, search, logins, captchas, streaming,
+downloads, complex apps, storage isolation, games and multiplayer, privacy and known
+limits — is in `CHECKLIST.md`. This is the short version.
+
 1. Homepage loads; footer shows `build v0.13.0 · path-embedded`; the header has
    a single **Settings** button (with no password the page says so).
 2. `/https://example.com`: page renders, link clicks stay on the relay.
@@ -902,8 +959,8 @@ change.
   read the *script-visible* (non-HttpOnly) cookies of other proxied sites by
   bypassing the shim, just as proxied sites already share `localStorage`. Treat
   the relay as one browser profile, not isolated sites. A cookie over about
-  3.8 KB is dropped, a site is capped at about 6 KB of cookies and all sites
-  together at about 10 KB (the largest untouched sites are expired), so heavy
+  3.8 KB is dropped, a site is capped at about 8 KB of cookies and all sites
+  together at about 14 KB (the largest untouched sites are expired), so heavy
   cookie users can be signed out of sites. `SameSite` is enforced from the
   page's site as best the relay can tell, `credentials: 'omit'` is not
   honoured, a built-in short list of multi-label suffixes stands in for the
@@ -951,6 +1008,13 @@ change.
   browser-initiated reload. The site list lives in a cookie: it is per browser,
   capped at 40 sites, and forgotten when cookies are cleared. Sites that read
   their origin or full URL, not just the path, can still misbehave.
+- **What the relay does not rewrite.** A dynamic `import('https://…')` in page code
+  (it is syntax, not a call) and absolute `url(https://…)` or `@import` inside a
+  stylesheet are fetched by the browser directly, around the relay; so are absolute
+  media URLs that a player builds in JavaScript (only HLS and DASH manifests are
+  rewritten). DRM-protected streaming (Netflix, Spotify, Disney+), WebTransport and
+  anything that needs the visitor's real address or a hardware-bound token cannot
+  work through any proxy.
 - **Bot-protected services** (AI chat endpoints such as duck.ai's, which
   answer `418` and ask to "verify you're human" over and over) may still not
   work even with the cookie jar. Their checks also rely on fingerprint and

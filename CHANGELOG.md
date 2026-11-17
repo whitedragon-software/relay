@@ -177,7 +177,7 @@
     cannot be aimed at them;
   - `/__relay_health` answers `{"ok":true}` before the password gate, for uptime
     monitors, and reveals nothing else.
-- Privacy: Settings → **Privacy** has a **WebRTC protection** switch. A page can
+- Privacy: Settings → **Privacy and sign-ins** (called Privacy until the switches below were added) has a **WebRTC protection** switch. A page can
   learn the visitor's real address through WebRTC (host and server-reflexive ICE
   candidates), which no header handling can hide. With the switch on, every
   `RTCPeerConnection` is created with `iceTransportPolicy: 'relay'`, so only
@@ -215,6 +215,71 @@
     before;
   - `openfront.io` is a suggested real-path site, because the game builds its
     worker and socket addresses from `location`.
+- Streaming. HLS playlists (`.m3u8`, any `mpegurl` type) and DASH manifests
+  (`.mpd`) are rewritten: an absolute media URL would be fetched by the player
+  straight from the CDN, around the relay (showing the visitor's address and failing
+  hotlink checks that expect the page's `Referer`), and a root-relative one would
+  escape to the relay's root. Absolute, protocol-relative and root-relative entries
+  — segment lines, `URI="…"` attributes of `#EXT-X-KEY`, `#EXT-X-MAP`, renditions —
+  and DASH `BaseURL`, `media`, `initialization`, `sourceURL` and `index` values now
+  go through the relay; plain relative entries are left alone, because they already
+  resolve against the proxied manifest. Only a `GET` that answered `200` with a body
+  under 2 MB is rewritten; the decoded text is returned without the stale
+  `Content-Length` / `Content-Encoding`, and live playlists are still never cached.
+- Downloads and encodings. A response sent with `Content-Disposition: attachment`
+  is passed through byte for byte even when its type is `text/html`; before, the
+  relay injected its scripts into a downloaded HTML file. The charset of a page is
+  preserved: `HTMLRewriter` passes the bytes it does not touch through unchanged, so
+  a Shift_JIS, GBK or windows-1251 page was labelled `utf-8` and turned into
+  mojibake. The `Content-Type` now repeats the declared charset, and without one it
+  carries none, so the browser reads the page's own `<meta charset>`.
+- Search. The tracking-redirect decoder also resolves Yahoo's `r.search.yahoo.com/…/RU=<destination>/RK=…`
+  links and Google's `/url?url=` form (besides `/url?q=`), on the server and in the
+  injected script, so a result opens its target directly.
+- Sign-ins and cookies:
+  - `Clear-Site-Data` is honoured for the part that matters: a response carrying
+    `"cookies"` or `"*"` (the usual logout) expires that site's cookies in the jar,
+    while the header itself is still never forwarded to the relay's origin;
+  - the multi-label suffix list grew from 30 to about 330 entries — country
+    registries (`com.cn`, `co.th`, `gov.in`, `com.ng`…) and private suffixes where
+    unrelated people host sites (`github.io`, `herokuapp.com`, `vercel.app`,
+    `netlify.app`, `pages.dev`, `workers.dev`, `blogspot.com`, `web.app`…). A cookie is
+    never filed for such a suffix, and two sites under one are different sites for
+    `SameSite`;
+  - cookie budgets: a site may hold about 8 KB in the jar (was 6) and all sites about
+    14 KB (was 10), which still keeps the `Cookie` header under Cloudflare's 16 KB
+    per-header limit, because sign-in providers that set many large cookies were being
+    trimmed;
+  - **Keep sign-ins** (Settings → Privacy and sign-ins, off by default): a session
+    cookie, which normally ends when the browser closes, is kept for 30 days, so a
+    login survives a restart. It applies to cookies set from then on;
+  - **Isolate site storage** (same place, off by default): every proxied site shares
+    the relay's one `localStorage`, `sessionStorage`, IndexedDB and cache storage, so
+    two sites using the same key overwrote each other and one could read another's
+    tokens. With the switch on, each real origin gets its own namespace: `localStorage`
+    and `sessionStorage` are replaced by a view over keys prefixed with the origin
+    (`getItem`, `setItem`, `removeItem`, `clear`, `key`, `length`, property access,
+    `Object.keys` and `JSON.stringify` all work), and IndexedDB database names and
+    cache names are prefixed the same way (`databases()`, `keys()` and `db.name` strip
+    the prefix). What a site saved before the switch stays out of its reach. The relay's
+    own use of `sessionStorage` (the debug log, the navigation-guard counter) goes
+    through the real one. `Storage.prototype` methods called on `localStorage` itself
+    no longer apply (it is not a real `Storage`), and `storage` events are unchanged.
+- Captchas. More providers get the page's real site name in their widget URLs and a
+  label in the panel: MTCaptcha, Yandex SmartCaptcha, Tencent captcha, Procaptcha,
+  Lemin and PerimeterX / HUMAN. `MessageEvent.origin` now also resolves the real origin
+  of a sender that lives on the relay's other hostname (game frames on their own
+  hostname): from the iframe that holds the sender, or from the referrer when the
+  sender is the embedding page, so a widget's origin check on those messages can pass.
+- Multiplayer. With the debug bar on, every WebSocket is logged when it opens
+  (`WS OPEN`) and when it closes (`WS CLOSE <code>`, with how many seconds it lived,
+  how many messages it carried and the reason), which separates "never connected"
+  from "dropped after a minute".
+- Speed. Static files get `stale-while-revalidate=604800` next to their one-day cache,
+  so a visit after the day still paints from cache while the browser refreshes it;
+  `toProxied` in the injected script keeps a small memo (dropped whenever the base
+  URL changes), saving the repeated URL parsing of apps that write thousands of
+  image and script addresses.
 - Page markup: a `<meta http-equiv="Content-Security-Policy">` (and the
   report-only variant) is removed. It is the in-markup twin of the CSP header
   the relay already drops, and once everything is served from the relay's
