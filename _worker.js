@@ -196,19 +196,23 @@ const COOKIES_PATH = '/cookies';
 // (from the Referer) matches GAME_HOSTS. Add portals here.
 const GAME_MODE = true;
 const GAME_HOSTS = /(^|\.)(openfront\.io|poki\.com|poki-gdn\.com|poki-cdn\.com|playhop\.com|games\.yandex\.(ru|com)|yandex\.net|yastatic\.net|crazygames\.com|gamedistribution\.com|gamemonetize\.com|y8\.com|itch\.io|itch\.zone|kongregate\.com|newgrounds\.com|ungrounded\.net|miniclip\.com|armorgames\.com|addictinggames\.com)$/i;
-// Ad / analytics hosts refused in game context. The answer is a 403 with an
-// empty body, which is what a browser ad-blocker looks like to an SDK (the
-// script's error event fires), so the SDK takes its "no ads" path and the game
-// starts instead of waiting on an ad request. Set GAME_BLOCK_ADS to false if a
-// game hangs because of it. OFF by default: blocking is a guess about how each
-// game's SDK reacts, and it is not worth risking a game that would otherwise load.
+// Ad and analytics hosts, refused in game context (GAME_BLOCK_ADS). Header bidding
+// (Prebid) fires a dozen auctions at once at page load, each with a ~2 s timeout,
+// and through a relay they time out ("signal is aborted without reason"), so a
+// game's start waited on ads that were never going to arrive. Refusing them at once
+// is faster: a POST (an auction, a log beacon) is answered 204 - OpenRTB's own "no
+// bid" - and anything else (a script, a pixel, an ad frame) gets an empty 403, which
+// is what a browser ad-blocker looks like to an SDK (the script's error event
+// fires), so the SDK takes its "no ads" path. Settings -> Privacy and sign-ins ->
+// "Allow ads on game sites" turns it off for one browser; set GAME_BLOCK_ADS to
+// false to turn it off for everyone.
 // Game PORTALS built as client-side apps (poki.com, playhop.com, crazygames.com)
 // need real-path mode (Settings -> Browsing mode), because their routers read
 // location.pathname. Only the portal belongs there, never the game's own host
 // (poki-gdn.com...): real-path mode keeps ONE real origin in a cookie shared by
 // every frame.
-const GAME_BLOCK_ADS = false;
-const GAME_AD_HOSTS = /(^|\.)(googlesyndication\.com|doubleclick\.net|googleadservices\.com|googletagservices\.com|googletagmanager\.com|google-analytics\.com|imasdk\.googleapis\.com|2mdn\.net|adnxs\.com|amazon-adsystem\.com|criteo\.(com|net)|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|smartadserver\.com|adsafeprotected\.com|moatads\.com|scorecardresearch\.com|hotjar\.com|connect\.facebook\.net|mc\.yandex\.(ru|com)|an\.yandex\.ru|adfox\.yandex\.ru|adfox\.ru|yandexadexchange\.net|yabs\.yandex\.ru|adfstat\.yandex\.ru)$/i;
+const GAME_BLOCK_ADS = true;
+const GAME_AD_HOSTS = /(^|\.)(googlesyndication\.com|doubleclick\.net|googleadservices\.com|googletagservices\.com|googletagmanager\.com|google-analytics\.com|imasdk\.googleapis\.com|2mdn\.net|adnxs\.com|appnexus\.com|amazon-adsystem\.com|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|indexww\.com|smartadserver\.com|adsafeprotected\.com|moatads\.com|doubleverify\.com|iasds01\.com|scorecardresearch\.com|hotjar\.com|connect\.facebook\.net|media\.net|a-mo\.net|richaudience\.com|unrulymedia\.com|3lift\.com|triplelift\.com|ay\.delivery|sonobi\.com|33across\.com|yellowblue\.io|connectad\.io|nexx360\.io|ingage\.tech|4dex\.io|marphezis\.com|presage\.io|intentiq\.com|fuseplatform\.net|adform\.net|improvedigital\.com|onetag-sys\.com|teads\.tv|sharethrough\.com|gumgum\.com|yieldmo\.com|taboola\.com|outbrain\.com|bidswitch\.net|adsrvr\.org|liveintent\.com|id5-sync\.com|bluekai\.com|krxd\.net|permutive\.com|lijit\.com|sovrn\.com|adkernel\.com|mgid\.com|adsco\.re|bat\.bing\.com|t\.poki\.io|an\.yandex\.ru|adfox\.yandex\.ru|adfox\.ru|yandexadexchange\.net|yabs\.yandex\.ru|adfstat\.yandex\.ru|criteo\.(com|net)|mc\.yandex\.(ru|com))$/i;
 // File types that count as game assets: edge-cached and long-cached even when
 // fetched via fetch()/XHR (which the normal rules treat as uncacheable).
 // Hosts that serve the GAME ITSELF (the iframe document), as opposed to the
@@ -1696,9 +1700,9 @@ function isBlockedTarget(hostname) {
 // Privacy and sign-in switches (Settings -> Privacy and sign-ins), kept in ONE
 // cookie as flags joined by "-": rtc (WebRTC protection), keep (keep sign-ins),
 // iso (isolate site storage).
-const PRIV_FLAGS = ['rtc', 'keep', 'iso'];
+const PRIV_FLAGS = ['rtc', 'keep', 'iso', 'ads'];
 function getPrivFlags(request) {
-  const out = { rtc: false, keep: false, iso: false };
+  const out = { rtc: false, keep: false, iso: false, ads: false };
   try {
     const raw = relayGetCookie(request, PRIV_COOKIE) || '';
     for (const f of raw.split('-')) {
@@ -1830,6 +1834,8 @@ function settingsPage(o) {
     'keep-off': 'Sign-ins end when the browser closes again, for cookies set from now on.',
     'iso-on': 'Site storage is isolated. Reload the pages you have open.',
     'iso-off': 'Site storage is shared again. Reload the pages you have open.',
+    'ads-on': 'Ads are allowed on game sites. Reload the game.',
+    'ads-off': 'Ads are blocked on game sites again. Reload the game.',
     'frame-set': 'Saved. Game frames now load from that hostname.',
     'frame-cleared': 'Saved. Game frames load from this hostname again.',
     'frame-invalid': 'That hostname does not work: it must be https and a different hostname under the same domain as this relay (for example play.' + (o.proxyHost || '').split('.').slice(-2).join('.') + ').'
@@ -1880,10 +1886,11 @@ function settingsPage(o) {
     '<div class="row"><div><b>' + e(title) + '</b><div class="sub">' + e(text) + '</div></div>' +
     form(flag + (priv[flag] ? '_off' : '_on'), {}, priv[flag] ? 'Turn off' : 'Turn on') + '</div>';
   const privacySection = '<section><h2>Privacy and sign-ins</h2>' +
-    '<p>Three switches, each remembered in this browser and off by default. They apply to pages opened on this hostname.</p>' +
+    '<p>Four switches, each remembered in this browser and off by default. They apply to pages opened on this hostname.</p>' +
     privRow('rtc', 'WebRTC protection', 'Forces WebRTC connections through a relay server, so a page cannot learn your real address through them. Calls and peer-to-peer games that bring no relay server may stop working.') +
     privRow('keep', 'Keep sign-ins', 'A site\'s session cookies (the ones with no expiry, which normally end when the browser closes) are kept for 30 days, so you stay signed in after a restart.') +
     privRow('iso', 'Isolate site storage', 'Gives each site its own localStorage, sessionStorage, IndexedDB and cache storage, so two sites that use the same key cannot read or overwrite each other. What a site saved before this was on stays out of its reach, so it may look signed out or lose saved state once.') +
+    privRow('ads', 'Allow ads on game sites', 'Game sites normally have their ad and tracking requests refused, so games start at once instead of waiting for ad auctions that time out through the relay. Turn this on if a game needs its ads to load.') +
     '</section>';
 
   const frameSection = '<section><h2>Game frames</h2>' +
@@ -2510,8 +2517,8 @@ async function handleRelayRequest(request, env, ctx) {
             // A stale real-path context would otherwise keep re-routing bare paths.
             headers.append('Set-Cookie', CTX_COOKIE + '=; Path=/; Max-Age=0; Secure; SameSite=Lax');
           }
-        } else if (/^(rtc|keep|iso)_(on|off)$/.test(action)) {
-          const pm = /^(rtc|keep|iso)_(on|off)$/.exec(action);
+        } else if (/^(rtc|keep|iso|ads)_(on|off)$/.test(action)) {
+          const pm = /^(rtc|keep|iso|ads)_(on|off)$/.exec(action);
           const cur = getPrivFlags(request);
           cur[pm[1]] = pm[2] === 'on';
           headers.append('Set-Cookie', privCookieHeader(cur));
@@ -2772,8 +2779,12 @@ async function handleRelayRequest(request, env, ctx) {
     }
     // Ad / analytics requests from a game: refuse like an ad-blocker would, so
     // the SDK's own "no ads" path runs instead of the game waiting on them.
-    if (gameCtx && GAME_BLOCK_ADS && GAME_AD_HOSTS.test(parsedTarget.hostname)) {
-      return new Response(null, { status: 403, headers: { 'Cache-Control': 'no-store', 'X-Relay-Blocked': '1' } });
+    const privFlags = getPrivFlags(request);
+    if (gameCtx && GAME_BLOCK_ADS && !privFlags.ads && GAME_AD_HOSTS.test(parsedTarget.hostname)) {
+      // 204 for a request that sends something (an auction, a beacon), 403 for a
+      // fetch (a script, a pixel, a frame): see GAME_BLOCK_ADS.
+      const sends = request.method !== 'GET' && request.method !== 'HEAD';
+      return new Response(null, { status: sends ? 204 : 403, headers: { 'Cache-Control': 'no-store', 'X-Relay-Blocked': '1' } });
     }
     const gameAsset = gameCtx && GAME_ASSET_PATH.test(parsedTarget.pathname);
 
@@ -2892,7 +2903,6 @@ async function handleRelayRequest(request, env, ctx) {
     }
 
     const upstreamHref = stripProxyFromQuery(parsedTarget, proxyOrigin, pageCtx.origin);
-    const privFlags = getPrivFlags(request);
     // Long-polling (socket.io's polling transport, Engine.IO, SSE-like endpoints)
     // holds a response for 25-30 s before sending headers, which the 20 s header
     // timeout read as a dead target and turned into a 502: "connection error".
@@ -3984,6 +3994,13 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       try {
         Object.defineProperty(navigator, 'onLine', { value: true, configurable: true });
       } catch (e) {}
+      // The page is told it is online (above); an 'offline' EVENT - one flaky moment
+      // on the visitor's own connection - would still make an app such as YouTube
+      // lay "You're offline" over a page that is working. It is stopped before the
+      // page's own listeners see it.
+      try {
+        window.addEventListener('offline', function(e) { e.stopImmediatePropagation(); }, true);
+      } catch (e) {}
 
       // document.baseURI is "<proxyOrigin>/<realAbsoluteUrl>" (see
       // BaseTagInjector). Strip the proxy prefix to recover the real
@@ -4590,7 +4607,7 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
       // ad blocker in the browser, a network that refuses them, an SDK probing
       // for blockers) and would bury the failures that matter, so they are left
       // out of the panel unless debug mode is on, and they are never retried.
-      var RELAY_AD_HOST = /^https?:\\/\\/([^\\/?#]*\\.)?(doubleclick\\.net|googlesyndication\\.com|googletagservices\\.com|googletagmanager\\.com|google-analytics\\.com|bat\\.bing\\.com|intentiq\\.com|fuseplatform\\.net|amazon-adsystem\\.com|adnxs\\.com|pubmatic\\.com|rubiconproject\\.com|criteo\\.(com|net)|openx\\.net|casalemedia\\.com|smartadserver\\.com|adsafeprotected\\.com|moatads\\.com|scorecardresearch\\.com|hotjar\\.com|connect\\.facebook\\.net|mc\\.yandex\\.(ru|com)|an\\.yandex\\.ru|adfox\\.ru|2mdn\\.net|imasdk\\.googleapis\\.com)(\\/|\\?|#|:|$)/i;
+      var RELAY_AD_HOST = /^https?:\\/\\/([^\\/?#]*\\.)?(googlesyndication\\.com|doubleclick\\.net|googleadservices\\.com|googletagservices\\.com|googletagmanager\\.com|google-analytics\\.com|imasdk\\.googleapis\\.com|2mdn\\.net|adnxs\\.com|appnexus\\.com|amazon-adsystem\\.com|rubiconproject\\.com|pubmatic\\.com|openx\\.net|casalemedia\\.com|indexww\\.com|smartadserver\\.com|adsafeprotected\\.com|moatads\\.com|doubleverify\\.com|iasds01\\.com|scorecardresearch\\.com|hotjar\\.com|connect\\.facebook\\.net|media\\.net|a-mo\\.net|richaudience\\.com|unrulymedia\\.com|3lift\\.com|triplelift\\.com|ay\\.delivery|sonobi\\.com|33across\\.com|yellowblue\\.io|connectad\\.io|nexx360\\.io|ingage\\.tech|4dex\\.io|marphezis\\.com|presage\\.io|intentiq\\.com|fuseplatform\\.net|adform\\.net|improvedigital\\.com|onetag-sys\\.com|teads\\.tv|sharethrough\\.com|gumgum\\.com|yieldmo\\.com|taboola\\.com|outbrain\\.com|bidswitch\\.net|adsrvr\\.org|liveintent\\.com|id5-sync\\.com|bluekai\\.com|krxd\\.net|permutive\\.com|lijit\\.com|sovrn\\.com|adkernel\\.com|mgid\\.com|adsco\\.re|bat\\.bing\\.com|t\\.poki\\.io|an\\.yandex\\.ru|adfox\\.yandex\\.ru|adfox\\.ru|yandexadexchange\\.net|yabs\\.yandex\\.ru|adfstat\\.yandex\\.ru|criteo\\.(com|net)|mc\\.yandex\\.(ru|com))(\\/|\\?|#|:|$)/i;
       var RELAY_AD_PATH = /\\/(ads|prebid)[\\/._-]/i;
       function relayIsAdUrl(u) {
         try { return RELAY_AD_HOST.test(u) || RELAY_AD_PATH.test(u); } catch (e) { return false; }
