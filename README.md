@@ -109,13 +109,14 @@ form post that redirects back with a short confirmation.
   (`localStorage`, the same key the homepage always used).
 - **Browsing mode** — which sites open in original mode (the default for every
   site) and which in real-path mode; see below.
-- **Privacy and sign-ins** — three switches, each off by default and remembered in
-  one `__relay_priv` cookie: **WebRTC protection** (forces WebRTC through a relay
+- **Privacy and sign-ins** — four switches, each off by default (for *Allow ads*
+  that means ads are blocked) and remembered in one `__relay_priv` cookie: **WebRTC protection** (forces WebRTC through a relay
   server so a page cannot learn your real address; it can stop calls and
   peer-to-peer games that bring no relay server), **Keep sign-ins** (a site's session
   cookies, which normally end when the browser closes, are kept for 30 days) and
   **Isolate site storage** (each site gets its own `localStorage`, `sessionStorage`,
-  IndexedDB and cache storage; see *Storage isolation*).
+  IndexedDB and cache storage; see *Storage isolation*) and **Allow ads on game
+  sites** (lets ad and tracking requests through on game sites; see *Gaming sites*).
 - **Game frames** — an optional second hostname for game frames; see *Game
   frames on their own hostname* below. Empty (off) by default.
 - **Debug bar** — shows the state of debug mode and turns it on or off. On, the
@@ -459,11 +460,19 @@ whose target host or whose page (from the `Referer`) is in `GAME_HOSTS`:
   page on a host the list does not know gets the same treatment at runtime when it
   has a `<canvas>` and fewer than five links. Fetches, sockets, workers and
   messages still go through the relay.
-- **Ad and analytics refusal** (`GAME_BLOCK_ADS`, **off** by default): requests to
-  `GAME_AD_HOSTS` get an empty `403`, which is how a browser ad-blocker looks to
-  an SDK (the script's error event fires), so the SDK takes its "no ads" path
-  instead of waiting on an ad request. It is off because how each game reacts is
-  not predictable; turn it on if ad requests stall a game.
+- **Ad and analytics refusal** (`GAME_BLOCK_ADS`, **on** by default). Header
+  bidding (Prebid) fires a dozen auctions at page load, each with a two-second
+  timeout; through the relay they all timed out ("signal is aborted without reason"),
+  so a game's start waited on ads that were never going to arrive. Requests to
+  `GAME_AD_HOSTS` (about 70 ad, header-bidding and analytics hosts, including the
+  bidders seen on Poki and PlayHop and Poki's own telemetry host) are refused at once:
+  a `POST` (an auction, a log beacon) gets `204`, OpenRTB's own "no bid", which raises
+  no error, and a fetch (a script, a pixel, an ad frame) gets an empty `403`, which is
+  how a browser ad-blocker looks to an SDK (the script's error event fires), so the
+  SDK takes its "no ads" path. Settings → Privacy and sign-ins → **Allow ads on game
+  sites** lets the requests through for one browser; set `GAME_BLOCK_ADS` to `false`
+  to turn the refusal off for everyone. Failures of ad hosts are also left out of
+  the diagnostic panel (see *Diagnostic panel*).
 
 **Game frames on their own hostname.** Some games refuse to run unless a portal
 embeds them (OpenFront on CrazyGames: "this version can be played exclusively on
@@ -859,7 +868,10 @@ limits — is in `CHECKLIST.md`. This is the short version.
     stays in original mode (`poki-gdn.com` is not in the list), and the `relay`
     button does not cover the game. Game assets (`.wasm`, `.data`) load with
     `Content-Type: application/wasm` for wasm and, on a repeat visit, come from
-    cache. If ads stall a game, set `GAME_BLOCK_ADS` to `true` and retry.
+    cache. Ad auctions and trackers (`navvy.media.net`, `1x1.a-mo.net`,
+    `pbs-poki-us.ay.delivery`…) are answered at once (204 for a POST, 403 otherwise)
+    and no longer pile up as "signal is aborted" entries. If a game needs its ads,
+    turn on **Allow ads on game sites** in Settings and reload.
 17. Headers: through the relay, a target that sends `Strict-Transport-Security`,
     `Content-Security-Policy` or `X-Frame-Options` (for example
     `https://example.com` or `https://github.com`) does not return them — check
@@ -993,9 +1005,9 @@ change.
   `document.referrer` is the only such value that is virtualised. A check of the
   *top* window's address can be satisfied by the second hostname for game frames
   (see *Game frames on their own hostname*), at the cost of one more custom
-  domain. `GAME_BLOCK_ADS` is a guess about how each
-  SDK reacts to a refused ad request, so it stays off until a game is known to
-  need it. Cross-origin isolation (`SharedArrayBuffer`, threaded wasm builds) is
+  domain. A game that insists on its ads (it waits for an ad to
+  finish before it starts) can hang on a refused ad request; **Allow ads on game
+  sites** in Settings lets them through. Cross-origin isolation (`SharedArrayBuffer`, threaded wasm builds) is
   not available, because the relay does not send the COOP/COEP headers. Some
   portals block Cloudflare's outbound addresses outright.
 - **Real-path mode trade-offs.** The address bar on those sites carries no

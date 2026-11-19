@@ -130,6 +130,7 @@ For each: does it load, does navigation inside it work, does the panel show erro
 - [ ] 8.9 `https://www.npmjs.com`, `https://stackoverflow.com` **(partial)**: Cloudflare-fronted; may show a bot check.
 - [ ] 8.10 `https://www.reddit.com`, `https://x.com` **(expected to fail or partly)**: login walls and bot checks.
 - [ ] 8.11 `https://discord.com/app`, `https://web.whatsapp.com` **(expected to fail)**: heavy WebSocket, service-worker and fingerprint checks.
+- [ ] 8.11a **YouTube offline screen:** `https://www.youtube.com`: it must not show "Connect to the internet — You're offline". If it still does, turn the debug bar on, reload, press **Copy** and look for a failed `youtubei` request: a status such as 302/429/403 with an HTML body (a consent page or a block served to the relay's address) means YouTube refused the relay, not that the page is offline. Send me that entry.
 - [ ] 8.12 Single-page-app navigation: on `https://react.dev` or `https://www.openstreetmap.org`, use the browser **Back** and **Forward** buttons after several in-page clicks: the page follows and the address bar stays valid.
 - [ ] 8.13 **Navigation guard (Chromium):** on any proxied page, in the console `location.href='https://example.org'` lands on `RELAY/https://example.org`, not the real site.
 - [ ] 8.14 `window.open`: in the console `window.open('https://example.org')` opens a **relay** tab.
@@ -151,6 +152,7 @@ For each: does it load, does navigation inside it work, does the panel show erro
 
 - [ ] 10.1 `https://poki.com` (real path): the portal renders; a game (Tiger Tank, Subway Surfers…) opens in its iframe, runs, and no `relay` button covers it.
 - [ ] 10.2 Reload a game you already played: it starts faster and the Network tab shows `.wasm`/`.data` from cache.
+- [ ] 10.2a **Ads on game sites:** open a Poki game (Tiger Tank, Level Devil). It starts without a long wait on ads; the panel shows no run of `ERR POST … signal is aborted` entries; in Network, requests to `navvy.media.net`, `pbs-poki-us.ay.delivery`, `t.poki.io` and similar answer **204** (POST) or **403** (script/pixel) straight from the relay. Settings → Privacy and sign-ins → **Allow ads on game sites** on, reload: those requests now go upstream (they may time out again; that is the reason they are blocked by default).
 - [ ] 10.3 `https://www.crazygames.com` (real path) **(partial)**: the portal loads and stays on the relay; many games open. A game showing "Oooops … can be played exclusively on CrazyGames.com" is CrazyGames' own embedding block (see the README, *Game frames*). With a second hostname set: press **Frames** in the game's iframe and report what it prints.
 - [ ] 10.4 `https://playhop.com` (real path) **(partial)**: portal loads; games depend on the Yandex SDK's own hostname checks.
 - [ ] 10.5 `https://itch.io/games/html5`: open an HTML5 game page; it runs in its iframe.

@@ -86,11 +86,21 @@
     does not know gets the same treatment at runtime when it has a `<canvas>` and
     fewer than five links. Everything else the script does is unchanged, so a
     game's fetches, sockets, workers and messages still go through the relay;
-  - optional ad and analytics refusal (`GAME_BLOCK_ADS`, **off** by default):
-    hosts in `GAME_AD_HOSTS` get an empty `403`, which is what a browser
-    ad-blocker looks like to an SDK (the script's error event fires), so the
-    SDK takes its "no ads" path. It is off because how each game reacts is
-    not predictable; turn it on per deployment if ad requests stall a game.
+  - ad and analytics refusal (`GAME_BLOCK_ADS`, **on** by default; it was off in
+    earlier builds of this release). Header bidding (Prebid) fires a dozen auctions
+    at page load, each with a two-second timeout, and through the relay they all
+    timed out ("signal is aborted without reason" in the panel), so a game's start
+    waited on ads that were never going to arrive. Requests to `GAME_AD_HOSTS` —
+    about 70 ad, header-bidding and analytics hosts, including every bidder seen on
+    Poki and PlayHop (media.net, a-mo.net, Rich Audience, Unruly, 3Lift, ay.delivery,
+    Sonobi, 33Across, YellowBlue, ConnectAd, Nexx360, Ingage, 4dex, Marphezis,
+    Presage) and Poki's own telemetry host — are now refused at once: a request that
+    sends something (a `POST`: an auction, a log beacon) gets `204`, which is
+    OpenRTB's own "no bid" and raises no error, and a fetch (a script, a pixel, an
+    ad frame) gets an empty `403`, which is what a browser ad-blocker looks like to
+    an SDK, so the SDK takes its "no ads" path. Settings → Privacy and sign-ins →
+    **Allow ads on game sites** (a fourth switch, `ads`) lets the requests through
+    for one browser; `GAME_BLOCK_ADS = false` turns the refusal off for everyone.
 - `.wasm` responses are served as `application/wasm` when upstream sends
   another type, so `WebAssembly.instantiateStreaming` works, and
   `application/wasm` joins the long-cacheable types.
@@ -177,7 +187,7 @@
     cannot be aimed at them;
   - `/__relay_health` answers `{"ok":true}` before the password gate, for uptime
     monitors, and reveals nothing else.
-- Privacy: Settings → **Privacy and sign-ins** (called Privacy until the switches below were added) has a **WebRTC protection** switch. A page can
+- Privacy: Settings → **Privacy and sign-ins** (called Privacy until the switches below were added; four switches in all, including *Allow ads on game sites*) has a **WebRTC protection** switch. A page can
   learn the visitor's real address through WebRTC (host and server-reflexive ICE
   candidates), which no header handling can hide. With the switch on, every
   `RTCPeerConnection` is created with `iceTransportPolicy: 'relay'`, so only
@@ -280,6 +290,14 @@
   `toProxied` in the injected script keeps a small memo (dropped whenever the base
   URL changes), saving the repeated URL parsing of apps that write thousands of
   image and script addresses.
+- Offline screens. The injected script already told pages they are online
+  (`navigator.onLine` is always `true`); it now also stops the `offline` **event**,
+  in the capture phase, before the page's own listeners see it. One flaky moment on
+  the visitor's own connection made apps such as YouTube lay "You're offline —
+  Check your connection" over a page that was working. This cannot help when the
+  screen is YouTube's answer to a failed request (a consent page or a block served
+  to the relay's address instead of JSON); the debug log, which records the status
+  and the first 200 characters of a failed response, shows that case.
 - Page markup: a `<meta http-equiv="Content-Security-Policy">` (and the
   report-only variant) is removed. It is the in-markup twin of the CSP header
   the relay already drops, and once everything is served from the relay's
