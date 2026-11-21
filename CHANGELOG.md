@@ -256,7 +256,7 @@
     `netlify.app`, `pages.dev`, `workers.dev`, `blogspot.com`, `web.app`…). A cookie is
     never filed for such a suffix, and two sites under one are different sites for
     `SameSite`;
-  - cookie budgets: a site may hold about 8 KB in the jar (was 6) and all sites about
+  - cookie budgets: a site may hold about 10 KB in the jar (was 6) and all sites about
     14 KB (was 10), which still keeps the `Cookie` header under Cloudflare's 16 KB
     per-header limit, because sign-in providers that set many large cookies were being
     trimmed;
@@ -290,6 +290,53 @@
   `toProxied` in the injected script keeps a small memo (dropped whenever the base
   URL changes), saving the repeated URL parsing of apps that write thousands of
   image and script addresses.
+- Sign-ins on complex sites. What can be fixed from inside the relay is fixed;
+  what the provider decides by judging the browser and the network is not (see
+  *Known limits* in the README), and for that there is a way around it.
+  - **Large cookies.** A value too big for one relay cookie is now split over up to
+    five numbered ones (`…name.1`, `…name.2`) and reassembled on every request. The
+    relay stores each cookie as base64url JSON, a third larger than the original, so
+    an upstream cookie of about 2.8 KB or more used to be dropped silently, and the
+    big, many-cookie sign-ins (Microsoft, Google, Amazon, Okta, Auth0) lost their
+    session cookie and looped. Setting a smaller value expires the stale chunks;
+    deleting the cookie expires every chunk and both flavours; a chunk set with a
+    missing piece falls back to the first cookie alone; a value too big even in
+    pieces is dropped, as before. The per-site budget is now 10 KB (was 8).
+  - **`redirect_uri` in request bodies.** A single-page app builds `redirect_uri`
+    from `location.origin`, which under the relay is the relay's. The query of a
+    request was already repaired; the same value is sent again in a `POST` body when
+    the code is exchanged (PKCE flows from MSAL, Auth0, Okta), and the provider
+    compares the two, so a body that still named the relay failed with
+    `invalid_grant` / `redirect_uri_mismatch`. The body of a sign-in-looking `POST`
+    (path with `oauth`, `token`, `authorize`, `connect`, `openid`, `saml`, `sso`,
+    `login`, `signin`, `session`, `b2c_…`…; form-encoded, JSON or text; at most 64 KB,
+    with a declared length) now has the relay's origin replaced by the real page's,
+    in the plain, percent-encoded and JSON-escaped forms, and a relay-wrapped URL
+    (`<relay>/https://real/x`) is unwrapped first. Other bodies are forwarded as the
+    stream they are.
+  - **Provider URLs built by the page.** The repair that gave captcha widgets the
+    page's real site name now also covers sign-in providers (Google accounts and
+    Identity Services, Facebook, Apple, Microsoft, Auth0, Okta, B2C, GitHub, Discord,
+    Slack, LinkedIn, X/Twitter, Twitch, Atlassian, OpenAI, Spotify), and the
+    parameters `redirect_uri`, `redirect_url`, `app_origin` and `ancestor_origins`
+    next to `origin`, `parent`, `host`, `hostname` and `domain`. Those values travel in
+    the URL **fragment** as often as in the query (Facebook's cross-domain arbiter),
+    and a fragment never reaches the Worker. A `redirect_uri` keeps its path
+    (`<relay>/cb?x=1` becomes `<real>/cb?x=1`) and a relay wrapper is dropped.
+  - **Import cookies** (Settings → Import cookies). Some sign-ins cannot be completed
+    through the relay: the provider judges the browser and the network (Google,
+    Microsoft, Facebook, Amazon, Cloudflare challenges). Signing in on the real site
+    in the visitor's own browser and handing the cookies to the relay's jar works
+    around that. Accepted: a JSON export from a cookie-export extension (an array,
+    or `{"cookies":[…]}`; HttpOnly cookies included; `domain`, `path`, `secure`,
+    `httpOnly`, `expirationDate`/`expires`, `sameSite`, `hostOnly`), a Netscape
+    `cookies.txt` (`#HttpOnly_` lines included), or a `Cookie` header copied from
+    DevTools with the host filled in (a leading dot makes the cookies domain-wide).
+    Expired cookies, names and values with forbidden characters, private or local
+    hosts and anything past 300 cookies or 200 KB are skipped; cookies without an
+    expiry are kept for 30 days; the page says how many were imported. The cookies
+    go through the same rules as any other jar cookie, so `__Host-`/`__Secure-`
+    prefixes are enforced and they are chunked and budgeted like the rest.
 - Offline screens. The injected script already told pages they are online
   (`navigator.onLine` is always `true`); it now also stops the `offline` **event**,
   in the capture phase, before the page's own listeners see it. One flaky moment on
