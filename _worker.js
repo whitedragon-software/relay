@@ -382,7 +382,8 @@ function derivedHostHint(targetHost, proxyOrigin) {
 const COOKIE_JAR = true;
 const JAR_PREFIX = '__rj_';
 const JAR_COOKIE_MAX = 3800;      // one relay cookie, name + value (browsers cap a cookie near 4 KB)
-const JAR_SITE_MAX = 8000;        // all of one site's cookies together (large sign-in providers set many)
+const JAR_SITE_MAX = 10000;       // all of one site's cookies together (large sign-in providers set many)
+const JAR_MAX_CHUNKS = 5;         // a value too big for one relay cookie is split over up to this many
 const JAR_BUDGET = 14000;         // every jar cookie together; keeps the Cookie header under Cloudflare's 16 KB per-header limit
 const JAR_MAX_AGE_MS = 400 * 24 * 3600 * 1000;
 // There is no public-suffix list in a single-file Worker; these multi-label
@@ -480,14 +481,23 @@ function jarCookieName(kind, key, path, name) {
 function parseJarName(rawName) {
   if (!rawName.startsWith(JAR_PREFIX)) return null;
   const parts = rawName.split('.');
-  if (parts.length !== 4) return null;
+  if (parts.length !== 4 && parts.length !== 5) return null;
   const kind = parts[0].slice(JAR_PREFIX.length);
   if (kind !== 'h' && kind !== 's') return null;
   const key = b64uDec(parts[1]);
   const path = b64uDec(parts[2]);
   const name = b64uDec(parts[3]);
   if (!key || !path || !name) return null;
-  return { kind, key, path, name };
+  // A fifth part is a chunk number: one upstream cookie whose value did not fit in
+  // one relay cookie (browsers cap a cookie near 4 KB, and a value stored as
+  // base64url JSON is a third larger than the original) is split over several.
+  let chunk = 0;
+  if (parts.length === 5) {
+    if (!/^\d{1,2}$/.test(parts[4])) return null;
+    chunk = parseInt(parts[4], 10);
+    if (chunk < 1) return null;
+  }
+  return { kind, key, path, name, chunk, base: parts.slice(0, 4).join('.') };
 }
 
 function jarExpireHeader(name) {
@@ -497,26 +507,50 @@ function jarExpireHeader(name) {
 // `forHost` (a lowercase hostname) skips decoding the cookies of other sites -
 // they still count toward the size budget, but a visitor with many sites'
 // cookies does not pay to decode them all on every request.
+function decodeJarRecord(text) {
+  const json = b64uDec(text);
+  if (!json) return null;
+  let v;
+  try {
+    v = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(v) || typeof v[0] !== 'string') return null;
+  return v;
+}
+
 function loadJar(request, forHost) {
   const jar = { records: [], raw: new Map(), ops: [], touched: new Set() };
+  const bases = new Map();   // base relay-cookie name -> { meta, parts }
   for (const [rawName, value] of parseCookieHeader(request.headers.get('Cookie'))) {
     const meta = parseJarName(rawName);
     if (!meta) continue;
     jar.raw.set(rawName, { size: rawName.length + value.length + 3, key: meta.key });
     if (forHost && !(forHost === meta.key || forHost.endsWith('.' + meta.key))) continue;
-    const json = b64uDec(value);
-    if (!json) continue;
-    let v;
-    try {
-      v = JSON.parse(json);
-    } catch {
-      continue;
+    let entry = bases.get(meta.base);
+    if (!entry) {
+      entry = { meta: null, parts: [] };
+      bases.set(meta.base, entry);
     }
-    if (!Array.isArray(v) || typeof v[0] !== 'string') continue;
+    entry.parts[meta.chunk] = value;
+    if (meta.chunk === 0) entry.meta = meta;
+  }
+  for (const [base, entry] of bases) {
+    const meta = entry.meta;
+    if (!meta) continue;                       // chunks without their first part
+    let v = null;
+    if (entry.parts.length > 1) {
+      let whole = true;
+      for (let i = 0; i < entry.parts.length; i++) if (typeof entry.parts[i] !== 'string') whole = false;
+      if (whole) v = decodeJarRecord(entry.parts.join(''));
+    }
+    if (!v) v = decodeJarRecord(entry.parts[0]);   // a single cookie, or a stale chunk set
+    if (!v) continue;
     jar.records.push({
       kind: meta.kind, key: meta.key, path: meta.path, name: meta.name, value: v[0],
       exp: Number(v[1]) || 0, secure: v[2] ? 1 : 0, hostOnly: v[3] ? 1 : 0,
-      sameSite: v[4] === 0 ? 0 : v[4] === 2 ? 2 : 1, rawName
+      sameSite: v[4] === 0 ? 0 : v[4] === 2 ? 2 : 1, rawName: base
     });
   }
   return jar;
@@ -633,28 +667,57 @@ function storeSetCookies(jar, target, lines, persistMs) {
     const kind = c.httpOnly ? 'h' : 's';
     const nameK = jarCookieName(kind, c.key, c.path, c.name);
     const nameO = jarCookieName(kind === 'h' ? 's' : 'h', c.key, c.path, c.name);
+    // Every relay cookie that belongs to one upstream cookie: the base one and its
+    // numbered chunks.
+    const family = (base) => {
+      const out = [];
+      for (const n of jar.raw.keys()) {
+        if (n === base || (n.startsWith(base + '.') && /^\d{1,2}$/.test(n.slice(base.length + 1)))) out.push(n);
+      }
+      return out;
+    };
     if (c.del) {
       // Always expire both flavours: a concurrent response may have set one
       // that this request's Cookie header does not show yet.
-      jar.ops.push(jarExpireHeader(nameK), jarExpireHeader(nameO));
-      jar.raw.delete(nameK);
-      jar.raw.delete(nameO);
+      for (const base of [nameK, nameO]) {
+        jar.ops.push(jarExpireHeader(base));
+        for (const n of family(base)) {
+          if (n !== base) jar.ops.push(jarExpireHeader(n));
+          jar.raw.delete(n);
+        }
+        jar.raw.delete(base);
+      }
       continue;
     }
-    if (jar.raw.has(nameO)) {                      // the same cookie, other flavour
-      jar.ops.push(jarExpireHeader(nameO));
-      jar.raw.delete(nameO);
+    for (const n of family(nameO)) {               // the same cookie, other flavour
+      jar.ops.push(jarExpireHeader(n));
+      jar.raw.delete(n);
     }
-    const value = b64uEnc(JSON.stringify([c.value, c.exp, c.secure ? 1 : 0, c.hostOnly ? 1 : 0, c.sameSite]));
-    const size = nameK.length + value.length + 3;
-    if (size > JAR_COOKIE_MAX) continue;           // too big for one cookie: dropped
+    const full = b64uEnc(JSON.stringify([c.value, c.exp, c.secure ? 1 : 0, c.hostOnly ? 1 : 0, c.sameSite]));
+    const room = JAR_COOKIE_MAX - nameK.length - 8;
+    if (room < 200) continue;
+    const pieces = [];
+    for (let i = 0; i < full.length; i += room) pieces.push(full.slice(i, i + room));
+    if (pieces.length > JAR_MAX_CHUNKS) continue;  // too big even in pieces: dropped
+    const names = pieces.map((_, i) => (i === 0 ? nameK : nameK + '.' + i));
+    let total = 0;
+    names.forEach((n, i) => { total += n.length + pieces[i].length + 3; });
+    const own = new Set(family(nameK));
     let siteSize = 0;
-    for (const [n, m] of jar.raw) if (m.key === c.key && n !== nameK) siteSize += m.size;
-    if (siteSize + size > JAR_SITE_MAX) continue;  // one site cannot hog the budget
+    for (const [n, m] of jar.raw) if (m.key === c.key && !own.has(n)) siteSize += m.size;
+    if (siteSize + total > JAR_SITE_MAX) continue; // one site cannot hog the budget
+    for (const n of own) {                         // chunks the new value no longer needs
+      if (names.indexOf(n) === -1) {
+        jar.ops.push(jarExpireHeader(n));
+        jar.raw.delete(n);
+      }
+    }
     let attrs = '; Path=/; Secure; SameSite=Lax' + (httpOnly(kind) ? '; HttpOnly' : '');
     if (c.exp) attrs += '; Max-Age=' + Math.max(1, Math.floor((c.exp - now) / 1000));
-    jar.ops.push(nameK + '=' + value + attrs);
-    jar.raw.set(nameK, { size, key: c.key });
+    names.forEach((n, i) => {
+      jar.ops.push(n + '=' + pieces[i] + attrs);
+      jar.raw.set(n, { size: n.length + pieces[i].length + 3, key: c.key });
+    });
     jar.touched.add(c.key);
   }
 }
@@ -1720,6 +1783,164 @@ function privCookieHeader(flags) {
   return PRIV_COOKIE + '=' + on.join('-') + '; Path=/; Max-Age=31536000; Secure; SameSite=Lax; HttpOnly';
 }
 
+// ---- Sign-in flows (OAuth / OpenID / SAML) ------------------------------------
+// A single-page app builds redirect_uri from location.origin, which under the relay
+// is the RELAY's. The query of a request is already repaired (stripProxyFromQuery),
+// but the same value is sent again in a POST body when the code is exchanged
+// (PKCE flows from MSAL, Auth0, Okta...), and the provider compares the two: a
+// body that still names the relay fails with invalid_grant / redirect_uri_mismatch.
+// Bodies of sign-in-looking POSTs (form-encoded, JSON or text, 64 KB or less, with a
+// known length) get the relay's origin replaced by the real page's, in the plain,
+// percent-encoded and JSON-escaped forms; a relay-wrapped URL
+// ("<relay>/https://real/x") is unwrapped first.
+const AUTH_PATH_HINT = /(^|\/)(oauth2?|token|authorize|auth|connect|openid|saml2?|sso|signin|sign-in|login|logon|session|sessions|idp|adfs|b2c_[\w-]+)(\/|\.|\?|$)|\/\.well-known\//i;
+
+function replaceRelayOrigin(text, relayOrigin, realOrigin) {
+  const lower = (v) => v.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
+  const esc = (v) => v.replace(/\//g, '\\/');
+  const enc = (v) => encodeURIComponent(v);
+  let out = String(text);
+  // unwrap first: "<relay>/https://real/x" -> "https://real/x"
+  for (const [a, b] of [
+    [relayOrigin + '/http', 'http'],
+    [esc(relayOrigin) + '\\/http', 'http'],
+    [enc(relayOrigin + '/http'), 'http'],
+    [lower(enc(relayOrigin + '/http')), 'http']
+  ]) out = out.split(a).join(b);
+  // then swap the bare origin
+  for (const [a, b] of [
+    [relayOrigin, realOrigin],
+    [esc(relayOrigin), esc(realOrigin)],
+    [enc(relayOrigin), enc(realOrigin)],
+    [lower(enc(relayOrigin)), lower(enc(realOrigin))]
+  ]) out = out.split(a).join(b);
+  return out;
+}
+
+// Returns the new body text, or null when the request is not rewritten (the
+// original body stream is then still untouched and is forwarded as it is).
+async function maybeRewriteAuthBody(request, target, proxyOrigin, pageCtx) {
+  try {
+    const ct = (request.headers.get('Content-Type') || '').toLowerCase();
+    if (!/application\/x-www-form-urlencoded|application\/json|text\/plain/.test(ct)) return null;
+    if (!AUTH_PATH_HINT.test(target.pathname)) return null;
+    const declared = parseInt(request.headers.get('Content-Length') || '', 10);
+    if (!(declared > 0 && declared <= 65536)) return null;
+  } catch {
+    return null;
+  }
+  const text = await request.text();
+  if (text.indexOf(new URL(proxyOrigin).host) === -1 && text.indexOf(encodeURIComponent(new URL(proxyOrigin).host)) === -1) return text;
+  return replaceRelayOrigin(text, proxyOrigin, pageCtx.origin || target.origin);
+}
+
+// ---- Cookie import --------------------------------------------------------------
+// Some sign-ins cannot be completed through the relay at all: the provider judges
+// the browser and the network (Google, Microsoft, Facebook, Amazon, Cloudflare
+// challenges). What works is signing in on the real site in the visitor's own
+// browser and handing the resulting cookies to the relay's jar. Accepted: a JSON
+// array (what cookie-export extensions write, HttpOnly cookies included), a
+// Netscape cookies.txt, or a Cookie header copied from DevTools (with the host).
+function importHost(h) {
+  const v = String(h || '').trim().toLowerCase().replace(/^\./, '').replace(/\.$/, '');
+  if (!v || v.length > 253 || !/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(v) || v.indexOf('.') === -1) return null;
+  if (isBlockedTarget(v)) return null;
+  return v;
+}
+
+function parseCookieImport(text, hostHint) {
+  const out = [];
+  const t = String(text || '').trim().slice(0, 200000);
+  if (!t) return out;
+  const now = Date.now();
+  const add = (c) => {
+    if (out.length >= 300) return;
+    const name = String(c.name || '');
+    const value = String(c.value == null ? '' : c.value);
+    if (!name || name.length > 256 || /[\s;=,"\\\x00-\x1f]/.test(name)) return;
+    if (value.length > 4000 || /[;\r\n\x00]/.test(value)) return;
+    const dom = String(c.domain || '').trim().toLowerCase();
+    const host = importHost(dom || hostHint);
+    if (!host) return;
+    let line = name + '=' + value + '; Path=' + (String(c.path || '/').charAt(0) === '/' ? String(c.path || '/') : '/');
+    const domainWide = dom ? (dom.charAt(0) === '.' || c.hostOnly === false) : String(hostHint || '').trim().charAt(0) === '.';
+    if (domainWide) line += '; Domain=' + host;
+    if (c.secure) line += '; Secure';
+    if (c.httpOnly) line += '; HttpOnly';
+    const ss = String(c.sameSite || '').toLowerCase();
+    if (ss === 'no_restriction' || ss === 'none') line += '; SameSite=None';
+    else if (ss === 'strict') line += '; SameSite=Strict';
+    else if (ss === 'lax') line += '; SameSite=Lax';
+    let exp = c.exp;
+    if (typeof exp === 'string') exp = /^\d+(\.\d+)?$/.test(exp) ? Number(exp) : Date.parse(exp) / 1000;
+    exp = Number(exp) || 0;
+    if (exp > 1e12) exp = exp / 1000;            // milliseconds
+    if (exp > 0) {
+      if (exp * 1000 <= now) return;             // already expired
+      line += '; Expires=' + new Date(exp * 1000).toUTCString();
+    }
+    out.push({ host, line });
+  };
+  if (t.charAt(0) === '[' || t.charAt(0) === '{') {
+    let arr = null;
+    try {
+      arr = JSON.parse(t);
+    } catch {
+      arr = null;
+    }
+    if (arr && !Array.isArray(arr) && Array.isArray(arr.cookies)) arr = arr.cookies;
+    if (Array.isArray(arr)) {
+      for (const o of arr) {
+        if (!o || typeof o.name !== 'string') continue;
+        add({
+          name: o.name, value: o.value, domain: o.domain || o.host || '', path: o.path, secure: !!o.secure,
+          httpOnly: !!(o.httpOnly || o.httponly), exp: o.expirationDate || o.expires || o.expiry || 0,
+          sameSite: o.sameSite || o.samesite, hostOnly: o.hostOnly
+        });
+      }
+      return out;
+    }
+  }
+  if (t.indexOf('\t') !== -1) {
+    for (const rawLine of t.split(/\r?\n/)) {
+      let line = rawLine;
+      let httpOnly = false;
+      if (line.startsWith('#HttpOnly_')) {
+        httpOnly = true;
+        line = line.slice('#HttpOnly_'.length);
+      } else if (!line || line.charAt(0) === '#') {
+        continue;
+      }
+      const f = line.split('\t');
+      if (f.length < 7) continue;
+      add({
+        domain: f[0], hostOnly: String(f[1]).toUpperCase() === 'FALSE' && f[0].charAt(0) !== '.', path: f[2],
+        secure: String(f[3]).toUpperCase() === 'TRUE', exp: f[4], name: f[5], value: f.slice(6).join('\t'), httpOnly
+      });
+    }
+    return out;
+  }
+  const header = t.replace(/^cookie:\s*/i, '');
+  for (const pair of header.split(/;\s*/)) {
+    const i = pair.indexOf('=');
+    if (i <= 0) continue;
+    add({ name: pair.slice(0, i).trim(), value: pair.slice(i + 1).trim(), domain: '', path: '/', secure: true });
+  }
+  return out;
+}
+
+function importCookies(request, text, hostHint) {
+  const items = parseCookieImport(text, hostHint);
+  const jar = loadJar(request);
+  let n = 0;
+  for (const it of items) {
+    const before = jar.ops.length;
+    storeSetCookies(jar, new URL('https://' + it.host + '/'), [it.line], 30 * 24 * 3600 * 1000);
+    if (jar.ops.length > before) n++;
+  }
+  return { n, headers: jarSetCookieHeaders(jar) };
+}
+
 // ---- Per-site browsing mode ---------------------------------------------------
 // Every site opens in original mode. A site the visitor switched to real-path
 // mode is listed (bare host, no "www.") in the MODE_COOKIE cookie, separated by
@@ -1834,13 +2055,15 @@ function settingsPage(o) {
     'keep-off': 'Sign-ins end when the browser closes again, for cookies set from now on.',
     'iso-on': 'Site storage is isolated. Reload the pages you have open.',
     'iso-off': 'Site storage is shared again. Reload the pages you have open.',
+    'import-none': 'No cookies were imported. Check the format and, for a pasted Cookie header, the host.',
     'ads-on': 'Ads are allowed on game sites. Reload the game.',
     'ads-off': 'Ads are blocked on game sites again. Reload the game.',
     'frame-set': 'Saved. Game frames now load from that hostname.',
     'frame-cleared': 'Saved. Game frames load from this hostname again.',
     'frame-invalid': 'That hostname does not work: it must be https and a different hostname under the same domain as this relay (for example play.' + (o.proxyHost || '').split('.').slice(-2).join('.') + ').'
   };
-  const noteText = Object.prototype.hasOwnProperty.call(NOTES, o.note) ? NOTES[o.note] : '';
+  const impMatch = /^imported-(\d{1,3})$/.exec(String(o.note || ''));
+  const noteText = impMatch ? 'Imported ' + impMatch[1] + ' cookie' + (impMatch[1] === '1' ? '' : 's') + '. Open the site through the relay.' : (Object.prototype.hasOwnProperty.call(NOTES, o.note) ? NOTES[o.note] : '');
   const real = o.realHosts || [];
 
   const form = (action, fields, label, cls) =>
@@ -1900,6 +2123,16 @@ function settingsPage(o) {
     '<div class="field"><input name="origin" value="' + e(o.frameOrigin || '') + '" placeholder="play.' + e((o.proxyHost || '').split('.').slice(-2).join('.')) + '" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" inputmode="url"><button type="submit">Save</button></div></form>' +
     (o.frameOrigin ? '<div class="actions">' + form('frame_clear', {}, 'Turn off') + '</div>' : '') +
     '<p class="sub" style="margin-top:12px">If a password is set, the game frame asks for it once on that hostname. Sites that read the real hostname of the game itself are still out of reach.</p></section>';
+
+  const importSection = COOKIE_JAR
+    ? '<section><h2>Import cookies</h2>' +
+      '<p>Some sign-ins cannot be completed through the relay: the provider judges your browser and network (Google, Microsoft, Facebook, Amazon, Cloudflare checks). Sign in on the real site in your normal browser instead, then paste the cookies here and the relay will use them. Accepted: a JSON export from a cookie-export extension (it includes HttpOnly cookies), a Netscape cookies.txt, or a <b>Cookie</b> header copied from DevTools → Network (then fill in the host).</p>' +
+      '<p class="sub">These cookies are as good as your password for that site: use this on your own relay, over HTTPS, and clear them when done. They are stored in this browser with the rest of the cookie jar.</p>' +
+      '<form method="POST" action="' + SETTINGS_PATH + '"><input type="hidden" name="action" value="cookies_import">' +
+      '<div class="field"><input name="host" placeholder="host, only for a pasted Cookie header (example.com, or .example.com for the whole domain)" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" inputmode="url"></div>' +
+      '<div class="field"><textarea name="data" rows="6" placeholder="paste cookies here" spellcheck="false" autocomplete="off" autocapitalize="none" autocorrect="off" style="flex:1;min-width:0;border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:4px;padding:10px 12px;font-size:13px;font-family:ui-monospace,monospace"></textarea></div>' +
+      '<div class="actions"><button type="submit">Import</button></div></form></section>'
+    : '';
 
   const ipSection = IP_WIDGET
     ? '<section><h2>Your IP</h2><p>Your address as Cloudflare sees it, and the address sites see when the relay fetches for you. Nothing is looked up until you press the button.</p>' +
@@ -1993,6 +2226,7 @@ function settingsPage(o) {
     ${frameSection}
     ${ipSection}
     ${cookieSection}
+    ${importSection}
     ${sessionSection}
   </div>
 
@@ -2536,6 +2770,10 @@ async function handleRelayRequest(request, env, ctx) {
               note = 'frame-invalid';
             }
           }
+        } else if (COOKIE_JAR && action === 'cookies_import') {
+          const res = importCookies(request, String(form.get('data') || ''), String(form.get('host') || ''));
+          for (const h of res.headers) headers.append('Set-Cookie', h);
+          note = res.n ? 'imported-' + res.n : 'import-none';
         } else if (action === 'debug_on' || action === 'debug_off') {
           const on = action === 'debug_on';
           headers.append('Set-Cookie', '__relay_debug=' + (on ? '1' : '') + '; Path=/; Max-Age=' + (on ? 86400 : 0) + '; Secure; SameSite=Lax');
@@ -2898,8 +3136,13 @@ async function handleRelayRequest(request, env, ctx) {
     // request, silently dropping POST bodies (breaks GraphQL calls, search
     // suggestions, and anything else proxied fetch/XHR calls send as POST).
     if (!['GET', 'HEAD'].includes(request.method) && request.body) {
-      upstreamInit.body = request.body;
-      upstreamInit.duplex = 'half';
+      const authBody = await maybeRewriteAuthBody(request, parsedTarget, proxyOrigin, pageCtx);
+      if (authBody !== null) {
+        upstreamInit.body = authBody;
+      } else {
+        upstreamInit.body = request.body;
+        upstreamInit.duplex = 'half';
+      }
     }
 
     const upstreamHref = stripProxyFromQuery(parsedTarget, proxyOrigin, pageCtx.origin);
@@ -4365,16 +4608,28 @@ function buildInjectedScript(proxyOrigin, cookieJar) {
         return /^https?:\\/\\/([^\\/?#]*\\.)?(hcaptcha\\.com|challenges\\.cloudflare\\.com|arkoselabs\\.com|funcaptcha\\.com|geetest\\.com|geevisit\\.com|friendlycaptcha\\.com|captcha-delivery\\.com|datadome\\.co|recaptcha\\.net|mtcaptcha\\.com|smartcaptcha\\.yandexcloud\\.net|captcha-api\\.yandex\\.ru|captcha\\.qq\\.com|qcloud\\.com|procaptcha\\.io|lemincaptcha\\.com|px-cloud\\.net|perimeterx\\.net|px-cdn\\.net)(\\/|\\?|#|$)/i.test(u) ||
           /^https?:\\/\\/(www\\.)?(google\\.com|gstatic\\.com)\\/recaptcha\\//i.test(u);
       }
+      // Sign-in providers (OAuth / OpenID / social login) check the page's origin the
+      // same way a captcha does: the widget or authorize URL carries it as origin=,
+      // parent=, redirect_uri=... (often in the fragment, which never reaches the
+      // Worker), and the page's script fills it in from location. Same repair.
+      function relayIsAuthUrl(u) {
+        return /^https?:\\/\\/([^\\/?#]*\\.)?(accounts\\.google\\.com|facebook\\.com|facebook\\.net|appleid\\.apple\\.com|login\\.microsoftonline\\.com|login\\.live\\.com|b2clogin\\.com|auth0\\.com|okta\\.com|oktapreview\\.com|onelogin\\.com|github\\.com|discord\\.com|slack\\.com|linkedin\\.com|twitter\\.com|x\\.com|id\\.twitch\\.tv|id\\.atlassian\\.com|auth\\.openai\\.com|accounts\\.spotify\\.com)(\\/|\\?|#|$)/i.test(u);
+      }
       function relayFixCaptchaUrl(abs) {
         try {
-          if (!RELAY_HOST || (abs.indexOf(RELAY_HOST) === -1 && abs.indexOf('co=') === -1) || !relayIsCaptchaUrl(abs)) return abs;
+          if (!RELAY_HOST || (abs.indexOf(RELAY_HOST) === -1 && abs.indexOf('co=') === -1) || !(relayIsCaptchaUrl(abs) || relayIsAuthUrl(abs))) return abs;
           var q = abs.search(/[?#]/);
           if (q < 0) return abs;
           var base = new URL(realBase());
-          var tail = abs.slice(q).replace(/([?&#](?:host|hostname|domain|parent|origin)=)([^&#]*)/gi, function(m, pre, val) {
+          var tail = abs.slice(q).replace(/([?&#](?:host|hostname|domain|parent|origin|redirect_uri|redirect_url|app_origin|ancestor_origins)=)([^&#]*)/gi, function(m, pre, val) {
             var dv;
             try { dv = decodeURIComponent(val); } catch (e) { return m; }
-            if (dv === proxyOrigin || dv.indexOf(proxyOrigin + '/') === 0) return pre + encodeURIComponent(base.origin);
+            if (dv === proxyOrigin || dv.indexOf(proxyOrigin + '/') === 0) {
+              // keep a path (redirect_uri=<relay>/callback); drop a relay wrapper
+              var restPath = dv.slice(proxyOrigin.length);
+              if (/^\\/https?:\\/\\//i.test(restPath)) return pre + encodeURIComponent(restPath.slice(1));
+              return pre + encodeURIComponent(base.origin + restPath);
+            }
             if (dv === RELAY_HOST) return pre + encodeURIComponent(base.host);
             return m;
           });
