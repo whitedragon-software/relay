@@ -128,6 +128,9 @@ form post that redirects back with a short confirmation.
 - **Cookie jar** — the sites that have cookies in this browser, with the number
   of cookies, a **Clear** button per site, **Clear all cookies**, and a link to
   `/cookies` (the names-only list).
+- **Import cookies** — paste cookies from a sign-in done in your normal browser (a
+  JSON export, a Netscape `cookies.txt`, or a `Cookie` header with the host) so the
+  relay can use them; see *Sign-ins on complex sites*.
 - **Session** — **Log out**, present only when a password is set.
 
 **Browsing mode.** **Original** is the default for every site: the target is
@@ -577,7 +580,7 @@ to that race. On every request the Worker turns the cookies that match the
 target (host-only vs. `Domain`, `Path`, `Secure`, expiry, `__Secure-`/`__Host-`
 prefixes, and `SameSite` judged against the page's site) into an ordinary
 `Cookie` header, and turns each upstream `Set-Cookie` into one relay
-`Set-Cookie` (set or expire). Limits: about 3.8 KB per cookie, 8 KB per site
+`Set-Cookie` (set or expire). Limits: about 3.8 KB per relay cookie (larger values are split over up to five), 10 KB per site
 and 14 KB in total; past that the largest untouched sites are expired so the
 browser's `Cookie` header can never grow past what Cloudflare accepts. The
 relay's own cookies live beside the jar and are not part of it: `__relay_pwd`
@@ -585,6 +588,41 @@ relay's own cookies live beside the jar and are not part of it: `__relay_pwd`
 context) and `__relay_debug`. To turn the jar off, set `COOKIE_JAR` to `false` at
 the top of `_worker.js` (redirects and caching then behave as in v0.10.0; POST
 forms still go through the relay, without cookies).
+
+**Sign-ins on complex sites.** Three things were made to work, and one workaround
+exists for the rest.
+
+- *Large cookies.* A value too big for one relay cookie (the relay stores each
+  cookie as base64url JSON, a third larger than the original, and browsers cap a
+  cookie near 4 KB) is split over up to five numbered relay cookies and reassembled on
+  every request, so big sign-ins (Microsoft, Google, Amazon, Okta, Auth0) keep their
+  session cookie instead of looping. A smaller value expires the stale chunks, a
+  delete expires all of them. A site may hold about 10 KB in the jar, all sites about
+  14 KB.
+- *`redirect_uri` and origins.* A single-page app builds `redirect_uri` from
+  `location.origin`, which under the relay is the relay's. The query of a request is
+  repaired (the relay's origin is replaced by the page's real one); the body of a
+  sign-in-looking `POST` (a path with `oauth`, `token`, `authorize`, `connect`,
+  `openid`, `saml`, `sso`, `login`, `signin`, `session`…, form-encoded, JSON or text,
+  64 KB or less) is repaired the same way, so the token exchange names the same
+  `redirect_uri` as the authorize request; and provider URLs a page builds
+  itself (Google accounts and Identity Services, Facebook, Apple, Microsoft, Auth0,
+  Okta, GitHub, Discord, Slack, LinkedIn, X, Twitch…) get the real origin in `origin`,
+  `parent`, `host`, `domain`, `redirect_uri` and `ancestor_origins`, in the query or
+  in the fragment (which never reaches the Worker). After the provider the redirect
+  back to the real site is wrapped into the relay like any other redirect, so you
+  return to the app inside the relay.
+- *Logouts and expiry* are honoured: `Clear-Site-Data` clears the site's jar cookies,
+  and **Keep sign-ins** keeps session cookies for 30 days.
+- *When the provider refuses the relay* — Google, Microsoft, Facebook and Amazon
+  judge the browser (TLS fingerprint, automation signals) and the network
+  (datacenter addresses), and no rewriting changes that — sign in on the real site in
+  your normal browser instead, export the cookies (a JSON export from a
+  cookie-export extension includes the HttpOnly ones, or copy the `Cookie` header from
+  DevTools → Network), and paste them under Settings → **Import cookies**. The
+  relay then uses them for that site. Cookies are tied to your account only as long
+  as the provider allows (some bind a session to the network that created it, and
+  then refuse it from the relay's address). Treat them like a password.
 
 **Storage isolation (opt-in).** Every proxied site lives on the relay's origin, so
 by default they all share one `localStorage`, `sessionStorage`, IndexedDB and cache
@@ -971,7 +1009,7 @@ change.
   read the *script-visible* (non-HttpOnly) cookies of other proxied sites by
   bypassing the shim, just as proxied sites already share `localStorage`. Treat
   the relay as one browser profile, not isolated sites. A cookie over about
-  3.8 KB is dropped, a site is capped at about 8 KB of cookies and all sites
+  3.8 KB is dropped, a site is capped at about 10 KB of cookies and all sites
   together at about 14 KB (the largest untouched sites are expired), so heavy
   cookie users can be signed out of sites. `SameSite` is enforced from the
   page's site as best the relay can tell, `credentials: 'omit'` is not
@@ -1020,6 +1058,15 @@ change.
   browser-initiated reload. The site list lives in a cookie: it is per browser,
   capped at 40 sites, and forgotten when cookies are cleared. Sites that read
   their origin or full URL, not just the path, can still misbehave.
+- **Sign-in limits.** Passkeys and security keys (WebAuthn) bind a credential to
+  the site's real hostname, which the browser checks against the relay's, so they
+  fail with a security error (a site normally offers a password or one-time code
+  instead). HTTP Digest, NTLM and Kerberos/Negotiate authentication bind their answer
+  to the request address or the connection, which the relay changes; Basic
+  authentication works. Providers that judge the TLS fingerprint, automation signals
+  or the network's reputation refuse a sign-in through the relay whatever it
+  rewrites; use **Import cookies**. A session bound to the address it was created
+  from can be refused from the relay's.
 - **What the relay does not rewrite.** A dynamic `import('https://…')` in page code
   (it is syntax, not a call) and absolute `url(https://…)` or `@import` inside a
   stylesheet are fetched by the browser directly, around the relay; so are absolute
