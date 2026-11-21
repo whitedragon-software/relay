@@ -71,7 +71,17 @@ is not proof of a relay fault: compare it with the same site opened directly.
 - [ ] 4.9 Real login on a real service with a **throwaway account**: `https://news.ycombinator.com/login`, `https://en.wikipedia.org/w/index.php?title=Special:UserLogin`. Stays signed in across clicks.
 - [ ] 4.10 `https://github.com/login` with `github.com` switched to real path **(partial)**: the form loads and posts; 2FA or a new-device check may block it.
 - [ ] 4.11 Heavy cookie sites **(partial)**: `https://www.amazon.com` or `https://www.microsoft.com` load while signed out; a sign-in there is expected to be refused or to loop.
-- [ ] 4.12 "Sign in with Google/Microsoft/Facebook" popups **(expected to fail)**: the popup opens on the relay; the provider rejects the browser or loops. A failure here is not a relay bug.
+- [ ] 4.12 "Sign in with Google/Microsoft/Facebook" popups **(expected to fail)**: the popup opens on the relay; the provider rejects the browser or loops. A failure here is not a relay bug; use 4.18.
+- [ ] 4.13 **Large cookies:** a sign-in that sets many or big cookies (`https://account.microsoft.com` **(partial)**, `https://login.okta.com`, an Auth0 login page) does not loop back to the login form. Settings → Cookie jar lists the site; DevTools → Application → Cookies on the relay origin shows `__rj_…` cookies, some ending in `.1` or `.2` (chunks), none above about 4 KB.
+- [ ] 4.14 **OAuth with a social provider:** on `https://gitlab.com/users/sign_in` or `https://vercel.com/login` choose "Sign in with GitHub" (throwaway account). The provider's authorize page opens, its address contains the **real** site in `redirect_uri` (not your relay's name), and after approving you land back on the app **inside the relay**.
+- [ ] 4.15 **OpenID playground:** `https://openidconnect.net` — Start, authorize, then the token exchange step completes (a single-page app that sends `redirect_uri` again in a `POST` body). `invalid_grant` or `redirect_uri_mismatch` here means the body rewrite is not matching; send me the request.
+- [ ] 4.16 **SAML / enterprise SSO** **(partial)**: a company SSO page that redirects through an identity provider and back (a `form_post` response) ends on the app, signed in, not on a blank or error page.
+- [ ] 4.17 **Passkeys** **(expected to fail)**: a "use a passkey" button reports a security error; the password / one-time-code option still works.
+- [ ] 4.18 **Import cookies, header format:** Settings → Import cookies, host `httpbin.org`, data `a=1; b=2` → "Imported 2 cookies"; `RELAY/https://httpbin.org/cookies` shows both. Settings → Cookie jar → Clear removes them.
+- [ ] 4.19 **Import cookies, real sign-in:** sign in to `github.com` (or another site that refuses the relay) in your normal browser, export its cookies as JSON with a cookie-export extension, paste them (leave host empty), then open `RELAY/https://github.com` (real path): you are signed in. Repeat for a site that sets HttpOnly session cookies. A refused session (signed out again at once) means the provider binds it to your network; that is the provider's rule.
+- [ ] 4.20 **Import cookies, Netscape format:** a `cookies.txt` export pastes and imports; expired cookies are skipped (the count is lower than the file's lines).
+- [ ] 4.21 **Big import:** paste a JSON export with more than 100 cookies: imports without an error page; the Cookie header on the next request to the site stays under 16 KB (no 431 from Cloudflare).
+- [ ] 4.22 **Basic vs Digest:** `/basic-auth/user/passwd` works (4.5); `https://httpbin.org/digest-auth/auth/user/passwd` **(expected to fail)** loops on the prompt (Digest binds the answer to the request address).
 
 ## 5. Captchas and bot checks
 
