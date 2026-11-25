@@ -140,6 +140,9 @@ const SW_PATH = '/__proxy_sw.js';
 const INJECT_PATH = '/__relay_inject.js';
 const SETTINGS_PATH = '/settings';
 const HEALTH_PATH = '/__relay_health';
+// Speed test: the page, and the endpoints it measures (see handleSpeedApi).
+const SPEED_PATH = '/speedtest';
+const SPEED_API = '/__relay_speed/';
 // Privacy switches chosen in Settings (cookie on the relay's origin).
 const PRIV_COOKIE = '__relay_priv';
 // Security headers for the relay's OWN pages (home, settings, cookies, login):
@@ -778,7 +781,7 @@ function recoverStatus(request) {
 // always carries ?redirect=, is the relay's. A POST is judged the same way: the
 // relay's own forms post from the relay's own pages, a proxied site's form
 // posts from a proxied page.
-const RELAY_ROUTE_PATHS = new Set(['/', '/login', '/logout', '/cookies', SETTINGS_PATH]);
+const RELAY_ROUTE_PATHS = new Set(['/', '/login', '/logout', '/cookies', SETTINGS_PATH, SPEED_PATH]);
 
 function looksLikeProxiedPageReferer(request, proxyOrigin) {
   const ref = request.headers.get('Referer');
@@ -925,7 +928,7 @@ self.addEventListener('install', (event) => {
       // so routing them statically skips waking the worker at all — a
       // visible difference on phones, where each SW wake-up adds latency
       // to the homepage and to the SW's own update checks.
-      const ownPaths = ['/', '/login', '/logout', '/cookies', '/__relay_ip', '/__relay_debug', '/__proxy_sw.js', '${INJECT_PATH}', '${SETTINGS_PATH}'];
+      const ownPaths = ['/', '/login', '/logout', '/cookies', '/__relay_ip', '/__relay_debug', '/__proxy_sw.js', '${INJECT_PATH}', '${SETTINGS_PATH}', '${SPEED_PATH}', '${SPEED_API}*'];
       for (const p of ownPaths) {
         try {
           const r2 = event.addRoutes({ condition: { urlPattern: { pathname: p } }, source: 'network' });
@@ -959,7 +962,7 @@ self.addEventListener('fetch', (event) => {
 
   // The relay's own pages: the server decides whether one is the relay's or a
   // proxied site's escaped link of the same name.
-  if (url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/cookies' || url.pathname === '/__relay_ip' || url.pathname === '/__relay_debug' || url.pathname === '${INJECT_PATH}' || url.pathname === '${SETTINGS_PATH}') return;
+  if (url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/cookies' || url.pathname === '/__relay_ip' || url.pathname === '/__relay_debug' || url.pathname === '${INJECT_PATH}' || url.pathname === '${SETTINGS_PATH}' || url.pathname === '${SPEED_PATH}' || url.pathname.indexOf('${SPEED_API}') === 0) return;
 
   // Already correctly path-embedded, or the SW script/root usage page — leave alone.
   if (/^\\/https?:\\/\\//.test(url.pathname)) return;
@@ -1679,6 +1682,585 @@ function buildHomeHtml(hasPassword) {
   return html;
 }
 
+// ---- Speed test ---------------------------------------------------------------
+// The page (/speedtest) measures the relay one hop at a time, so a slow number can
+// be pinned to a hop instead of guessed at:
+//   ping   browser <-> Cloudflare edge <-> Worker (and where the edge is)
+//   down   Worker -> browser throughput (random bytes made in the Worker)
+//   up     browser -> Worker throughput (bytes counted and dropped)
+//   fetch  Worker -> a site: time to first byte and speed, measured IN the Worker
+//   ws     a WebSocket echo in the Worker (the browser <-> Worker round trip)
+// Everything sits behind the password gate, and a request that declares itself
+// cross-site is refused (a page on another site must not be able to make the relay
+// stream megabytes at you).
+let SPEED_CHUNK = null;
+function speedChunk() {
+  if (!SPEED_CHUNK) {
+    SPEED_CHUNK = new Uint8Array(65536);
+    crypto.getRandomValues(SPEED_CHUNK);
+  }
+  return SPEED_CHUNK;
+}
+
+function speedJson(obj, status) {
+  return new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }
+  });
+}
+
+function speedAllowed(request, proxyOrigin) {
+  const sfs = request.headers.get('Sec-Fetch-Site');
+  if (sfs && sfs !== 'same-origin' && sfs !== 'none') return false;
+  const origin = request.headers.get('Origin');
+  if (origin && origin !== proxyOrigin) return false;
+  return true;
+}
+
+async function handleSpeedApi(request, url, proxyOrigin) {
+  if (!speedAllowed(request, proxyOrigin)) return forbiddenPage();
+  const op = url.pathname.slice(SPEED_API.length);
+  const cf = request.cf || {};
+
+  if (op === 'ping' && (request.method === 'GET' || request.method === 'HEAD')) {
+    return speedJson({
+      ok: true, colo: cf.colo || null, country: cf.country || null, city: cf.city || null,
+      asn: cf.asn || null, org: cf.asOrganization || null, http: cf.httpProtocol || null, tls: cf.tlsVersion || null
+    });
+  }
+
+  if (op === 'down' && request.method === 'GET') {
+    const total = Math.max(1, Math.min(50 * 1024 * 1024, parseInt(url.searchParams.get('bytes') || '1048576', 10) || 1048576));
+    const chunk = speedChunk();
+    let sent = 0;
+    const body = new ReadableStream({
+      pull(controller) {
+        const left = total - sent;
+        if (left <= 0) {
+          controller.close();
+          return;
+        }
+        const n = Math.min(left, chunk.length);
+        controller.enqueue(n === chunk.length ? chunk.slice() : chunk.slice(0, n));
+        sent += n;
+      }
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(total), 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }
+    });
+  }
+
+  if (op === 'up' && request.method === 'POST') {
+    const t0 = Date.now();
+    let bytes = 0;
+    if (request.body) {
+      const reader = request.body.getReader();
+      for (;;) {
+        const r = await reader.read();
+        if (r.done) break;
+        bytes += r.value.length;
+        if (bytes > 64 * 1024 * 1024) {
+          try { await reader.cancel(); } catch { /* done */ }
+          break;
+        }
+      }
+    }
+    return speedJson({ ok: true, bytes, ms: Date.now() - t0 });
+  }
+
+  if (op === 'fetch' && request.method === 'GET') {
+    let target;
+    try {
+      target = new URL(url.searchParams.get('url') || '');
+    } catch {
+      return speedJson({ ok: false, error: 'bad address' }, 400);
+    }
+    if (!/^https?:$/.test(target.protocol) || target.host === url.host || isBlockedTarget(target.hostname)) {
+      return speedJson({ ok: false, error: 'address not allowed' }, 400);
+    }
+    const cap = Math.max(1000, Math.min(8 * 1024 * 1024, parseInt(url.searchParams.get('bytes') || '2000000', 10) || 2000000));
+    const t0 = Date.now();
+    try {
+      const res = await fetchWithTimeout(target.href, {
+        method: 'GET',
+        redirect: 'follow',
+        headers: { 'User-Agent': request.headers.get('User-Agent') || FALLBACK_USER_AGENT, 'Accept': '*/*', 'Cache-Control': 'no-cache' },
+        cf: { cacheTtl: 0 }
+      }, 15000);
+      const ttfb = Date.now() - t0;
+      let bytes = 0;
+      if (res.body) {
+        const reader = res.body.getReader();
+        for (;;) {
+          const r = await reader.read();
+          if (r.done) break;
+          bytes += r.value.length;
+          if (bytes >= cap) {
+            try { await reader.cancel(); } catch { /* done */ }
+            break;
+          }
+        }
+      }
+      const total = Date.now() - t0;
+      return speedJson({
+        ok: true, status: res.status, finalUrl: res.url || target.href, ttfb, total, bytes,
+        mbps: total > ttfb && bytes > 50000 ? (bytes * 8) / ((total - ttfb) / 1000) / 1e6 : null,
+        type: res.headers.get('content-type') || '', colo: cf.colo || null
+      });
+    } catch (err) {
+      return speedJson({ ok: false, error: String((err && err.message) || err).slice(0, 200), ttfb: Date.now() - t0 });
+    }
+  }
+
+  return speedJson({ ok: false, error: 'unknown operation' }, 404);
+}
+
+// A WebSocket that sends every message straight back, for round-trip timing.
+function speedWsEcho(request, proxyOrigin) {
+  if (!speedAllowed(request, proxyOrigin)) return forbiddenPage();
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+  server.addEventListener('message', (e) => {
+    try {
+      const size = typeof e.data === 'string' ? e.data.length : (e.data.byteLength || 0);
+      if (size > 65536) {
+        wsSafeClose(server, 4009, 'message too big');
+        return;
+      }
+      server.send(e.data);
+    } catch {
+      // the other side is gone
+    }
+  });
+  server.addEventListener('close', (e) => wsSafeClose(server, e.code, e.reason));
+  return new Response(null, { status: 101, webSocket: client });
+}
+
+function speedPage() {
+  return `<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#FFFFFF">
+<title>Relay — Speed test</title>
+<script>try{var t=localStorage.getItem('relay-theme');if(t==='dark'||t==='light')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+<style>
+  :root { --bg:#FFFFFF; --surface:#F6F6F5; --border:#E1E1DE; --text:#131316; --text-dim:#6C6C72; --accent:#2547F4; --warn:#C7431E; --good:#1A7F4B; }
+  html[data-theme="dark"] { --bg:#0A0A0C; --surface:#151517; --border:#29292D; --text:#F1F1EF; --text-dim:#8B8B91; --accent:#6C89FF; --warn:#FF8A63; --good:#4CC38A; }
+  * { box-sizing: border-box; }
+  button, a, input, textarea { touch-action: manipulation; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; -webkit-tap-highlight-color:transparent; }
+  .wrap { max-width:720px; margin:0 auto; padding:max(28px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(60px, calc(40px + env(safe-area-inset-bottom))) max(20px, env(safe-area-inset-left)); }
+  .top a { color:var(--text-dim); text-decoration:none; font-family:ui-monospace,monospace; font-size:13px; letter-spacing:.08em; text-transform:uppercase; }
+  h1 { font-size:28px; margin:18px 0 10px; letter-spacing:-0.02em; }
+  h2 { font-size:14px; margin:0 0 8px; text-transform:uppercase; letter-spacing:.08em; font-family:ui-monospace,monospace; color:var(--accent); font-weight:500; }
+  section { border-top:1px solid var(--border); padding:18px 0; }
+  p { font-size:14px; line-height:1.5; color:var(--text-dim); margin:0 0 12px; }
+  .sub { font-size:12px; color:var(--text-dim); }
+  button, .btn { border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:4px; padding:10px 16px; cursor:pointer; font-size:14px; font-family:inherit; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  .actions { display:flex; flex-wrap:wrap; gap:10px; margin:12px 0 0; }
+  label { display:inline-flex; align-items:center; gap:6px; font-size:14px; margin:0 14px 6px 0; }
+  textarea, input[type=text] { width:100%; border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:4px; padding:10px 12px; font-size:14px; font-family:ui-monospace,monospace; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin:6px 0 4px; }
+  td, th { text-align:left; padding:7px 6px; border-bottom:1px solid var(--border); vertical-align:top; word-break:break-word; }
+  th { color:var(--text-dim); font-weight:500; font-size:12px; }
+  td.num, th.num { text-align:right; white-space:nowrap; font-family:ui-monospace,monospace; }
+  .status { font-family:ui-monospace,monospace; font-size:13px; color:var(--text-dim); min-height:20px; margin-top:10px; }
+  .bar { height:4px; background:var(--border); border-radius:2px; overflow:hidden; margin-top:8px; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  .good { color:var(--good); } .warn { color:var(--warn); }
+  .verdict li { font-size:14px; line-height:1.5; margin:0 0 6px; }
+  .scroll { overflow-x:auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><a href="/settings">&larr; Settings</a></div>
+  <h1>Speed test</h1>
+  <p>Measures the relay one hop at a time: your connection to Cloudflare, the Worker's download and upload speed, Cloudflare to the sites you list (compared with reaching them directly), and a WebSocket round trip, which is what multiplayer games feel. It uses a few megabytes of data. Nothing is stored.</p>
+
+  <section>
+    <h2>What to run</h2>
+    <label><input type="checkbox" id="gLat" checked> Latency</label>
+    <label><input type="checkbox" id="gXfer" checked> Download / upload</label>
+    <label><input type="checkbox" id="gSites" checked> Sites</label>
+    <label><input type="checkbox" id="gWs" checked> WebSocket</label>
+    <p class="sub" style="margin-top:10px">Sites to compare, one address per line (up to 6). Each is timed directly from your browser, through the relay, and from the Worker.</p>
+    <textarea id="siteList" rows="4" spellcheck="false" autocapitalize="none" autocorrect="off">https://example.com/
+https://www.wikipedia.org/
+https://www.cloudflare.com/cdn-cgi/trace</textarea>
+    <label style="margin-top:8px"><input type="checkbox" id="bust" checked> add a cache-busting parameter</label>
+    <p class="sub" style="margin:10px 0 6px">Optional: a WebSocket echo server to time through the relay's bridge (the full path a game uses).</p>
+    <input type="text" id="wsCustom" placeholder="wss://ws.postman-echo.com/raw" spellcheck="false" autocapitalize="none" autocorrect="off">
+    <div class="actions">
+      <button class="primary" id="runBtn" type="button">Run test</button>
+      <button id="stopBtn" type="button" disabled>Stop</button>
+      <button id="copyBtn" type="button" disabled>Copy results</button>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="bar"><div id="barFill"></div></div>
+  </section>
+
+  <section id="sLat" hidden><h2>Latency</h2><div id="rLat"></div></section>
+  <section id="sXfer" hidden><h2>Download and upload</h2><div id="rXfer"></div></section>
+  <section id="sSites" hidden><h2>Sites</h2><div class="scroll" id="rSites"></div></section>
+  <section id="sWs" hidden><h2>WebSocket round trip</h2><div id="rWs"></div></section>
+  <section id="sVerdict" hidden><h2>What this means</h2><ul class="verdict" id="rVerdict" style="padding-left:18px;margin:0"></ul></section>
+</div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var running = false;
+  var ctl = null;
+  var report = [];
+  var R = {};
+
+  function now() { return performance.now(); }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+  function median(a) {
+    if (!a.length) return null;
+    var b = a.slice().sort(function (x, y) { return x - y; });
+    var m = Math.floor(b.length / 2);
+    return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2;
+  }
+  function ms(v) { return v == null ? 'n/a' : (v < 10 ? v.toFixed(1) : String(Math.round(v))) + ' ms'; }
+  function mbps(v) { return v == null ? 'n/a' : (v < 10 ? v.toFixed(2) : v.toFixed(1)) + ' Mbit/s'; }
+  function status(t) { $('status').textContent = t; }
+  function bar(f) { $('barFill').style.width = Math.max(0, Math.min(1, f)) * 100 + '%'; }
+  function show(id) { $(id).hidden = false; }
+  function row(label, value, cls) { return '<tr><td>' + esc(label) + '</td><td class="num ' + (cls || '') + '">' + value + '</td></tr>'; }
+  function note(line) { report.push(line); }
+  function signal() { return ctl ? ctl.signal : undefined; }
+
+  // ---- latency ----------------------------------------------------------------
+  async function doLatency() {
+    status('Latency...');
+    var first = null, info = null, times = [];
+    for (var i = 0; i < 12; i++) {
+      var t0 = now();
+      var r = await fetch('/__relay_speed/ping?i=' + i + '&r=' + Math.random(), { cache: 'no-store', signal: signal() });
+      var j = await r.json();
+      var dt = now() - t0;
+      if (i === 0) { first = dt; info = j; } else { times.push(dt); }
+      bar(0.1 * (i + 1) / 12);
+      await sleep(60);
+    }
+    var jit = 0;
+    for (var k = 1; k < times.length; k++) jit += Math.abs(times[k] - times[k - 1]);
+    jit = times.length > 1 ? jit / (times.length - 1) : 0;
+    R.lat = { first: first, min: Math.min.apply(null, times), median: median(times), max: Math.max.apply(null, times), jitter: jit, info: info || {} };
+    var inf = R.lat.info;
+    var html = '<table>' +
+      row('Cloudflare location serving you', esc(inf.colo || 'unknown') + (inf.country ? ' (' + esc(inf.country) + (inf.city ? ', ' + esc(inf.city) : '') + ')' : '')) +
+      row('Your network', esc(inf.org || 'unknown')) +
+      row('Connection', esc((inf.http || '?') + ' / ' + (inf.tls || '?'))) +
+      row('First request (includes connecting)', ms(first)) +
+      row('Round trip: best', ms(R.lat.min)) +
+      row('Round trip: typical (median)', ms(R.lat.median), R.lat.median < 80 ? 'good' : (R.lat.median > 150 ? 'warn' : '')) +
+      row('Round trip: worst', ms(R.lat.max)) +
+      row('Jitter (average change between requests)', ms(jit), jit > 30 ? 'warn' : '') + '</table>';
+    $('rLat').innerHTML = html;
+    show('sLat');
+    note('Latency: edge ' + (inf.colo || '?') + ', first ' + ms(first) + ', best ' + ms(R.lat.min) + ', median ' + ms(R.lat.median) + ', worst ' + ms(R.lat.max) + ', jitter ' + ms(jit) + ', ' + (inf.http || '?') + ', network ' + (inf.org || '?'));
+  }
+
+  // ---- download / upload ------------------------------------------------------
+  async function downloadOnce(bytes) {
+    var t0 = now();
+    var r = await fetch('/__relay_speed/down?bytes=' + bytes + '&r=' + Math.random(), { cache: 'no-store', signal: signal() });
+    var ttfb = now() - t0;
+    var reader = r.body.getReader();
+    var got = 0;
+    for (;;) {
+      var c = await reader.read();
+      if (c.done) break;
+      got += c.value.length;
+    }
+    var total = now() - t0;
+    var xfer = Math.max(total - ttfb, 1);
+    return { bytes: got, ttfb: ttfb, total: total, mbps: got * 8 / (xfer / 1000) / 1e6 };
+  }
+  async function downloadParallel(n, bytes) {
+    var t0 = now();
+    var list = [];
+    for (var i = 0; i < n; i++) list.push(downloadOnce(bytes));
+    var res = await Promise.all(list);
+    var el = (now() - t0) / 1000;
+    var sum = 0;
+    for (var k = 0; k < res.length; k++) sum += res[k].bytes;
+    return { bytes: sum, mbps: sum * 8 / el / 1e6 };
+  }
+  function randomBuffer(n) {
+    var b = new Uint8Array(n);
+    for (var i = 0; i < n; i += 65536) crypto.getRandomValues(b.subarray(i, Math.min(n, i + 65536)));
+    return b;
+  }
+  async function uploadOnce(bytes) {
+    var buf = randomBuffer(bytes);
+    var t0 = now();
+    var r = await fetch('/__relay_speed/up', { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' }, cache: 'no-store', signal: signal() });
+    var j = await r.json();
+    var t = now() - t0;
+    return { bytes: j.bytes || bytes, total: t, mbps: (j.bytes || bytes) * 8 / (t / 1000) / 1e6 };
+  }
+  async function doTransfer() {
+    status('Download (small)...');
+    var small = await downloadOnce(1048576);
+    bar(0.15);
+    var bigBytes = Math.max(1048576, Math.min(40 * 1048576, Math.round(small.mbps * 1e6 / 8 * 3)));
+    status('Download (' + Math.round(bigBytes / 1048576) + ' MB)...');
+    var big = bigBytes > 1500000 ? await downloadOnce(bigBytes) : small;
+    bar(0.25);
+    status('Download (4 parallel)...');
+    var par = await downloadParallel(4, Math.min(10485760, Math.max(1048576, Math.round(bigBytes / 4))));
+    bar(0.33);
+    status('Upload (small)...');
+    var upSmall = await uploadOnce(1048576);
+    var upBytes = Math.max(1048576, Math.min(20 * 1048576, Math.round(upSmall.mbps * 1e6 / 8 * 3)));
+    status('Upload (' + Math.round(upBytes / 1048576) + ' MB)...');
+    var upBig = upBytes > 1500000 ? await uploadOnce(upBytes) : upSmall;
+    bar(0.4);
+    R.xfer = { downSmall: small, down: big, par: par, upSmall: upSmall, up: upBig };
+    var html = '<table>' +
+      row('Download, one connection (' + Math.round(big.bytes / 1048576) + ' MB)', mbps(big.mbps), big.mbps > 25 ? 'good' : (big.mbps < 5 ? 'warn' : '')) +
+      row('Download, 4 connections at once', mbps(par.mbps)) +
+      row('Time to first byte of a download', ms(big.ttfb)) +
+      row('Upload (' + Math.round(upBig.bytes / 1048576) + ' MB)', mbps(upBig.mbps), upBig.mbps < 3 ? 'warn' : '') + '</table>';
+    $('rXfer').innerHTML = html;
+    show('sXfer');
+    note('Transfer: download ' + mbps(big.mbps) + ' (one connection), ' + mbps(par.mbps) + ' (4 at once), upload ' + mbps(upBig.mbps) + ', first byte ' + ms(big.ttfb));
+  }
+
+  // ---- sites ------------------------------------------------------------------
+  function bust(u) {
+    if (!$('bust').checked) return u;
+    return u + (u.indexOf('?') === -1 ? '?' : '&') + '__speed=' + Math.random().toString(36).slice(2, 10);
+  }
+  async function timeDirect(u) {
+    var t0 = now();
+    try {
+      await fetch(bust(u), { mode: 'no-cors', cache: 'no-store', signal: signal() });
+      return { ttfb: now() - t0 };
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      return { error: 'blocked or failed' };
+    }
+  }
+  async function timeRelay(u) {
+    var t0 = now();
+    try {
+      var r = await fetch('/' + bust(u), { cache: 'no-store', signal: signal() });
+      var ttfb = now() - t0;
+      var buf = await r.arrayBuffer();
+      return { ttfb: ttfb, total: now() - t0, status: r.status, bytes: buf.byteLength };
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      return { error: 'failed' };
+    }
+  }
+  async function timeWorker(u) {
+    try {
+      var r = await fetch('/__relay_speed/fetch?url=' + encodeURIComponent(bust(u)) + '&bytes=2000000', { cache: 'no-store', signal: signal() });
+      return await r.json();
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      return { ok: false, error: 'failed' };
+    }
+  }
+  async function doSites() {
+    var urls = $('siteList').value.split('\\n').map(function (l) { return l.trim(); }).filter(function (l) { return l; }).slice(0, 6);
+    var rows = [];
+    R.sites = [];
+    for (var i = 0; i < urls.length; i++) {
+      var u = urls[i];
+      if (u.indexOf('http') !== 0) u = 'https://' + u;
+      status('Site ' + (i + 1) + ' of ' + urls.length + ': ' + u);
+      await timeDirect(u);
+      var d = [], v = [], vt = [], w = [], wt = [];
+      var st = null, bytes = null, err = null;
+      for (var k = 0; k < 3; k++) {
+        var a = await timeDirect(u);
+        if (a.ttfb != null) d.push(a.ttfb);
+        var b = await timeRelay(u);
+        if (b.ttfb != null) { v.push(b.ttfb); vt.push(b.total); st = b.status; bytes = b.bytes; } else { err = b.error; }
+        var c = await timeWorker(u);
+        if (c && c.ok) { w.push(c.ttfb); wt.push(c.total); } else if (c && c.error) { err = c.error; }
+        bar(0.4 + 0.4 * ((i * 3 + k + 1) / (urls.length * 3)));
+      }
+      var dm = median(d), vm = median(v), vtm = median(vt), wm = median(w);
+      var over = dm != null && vm != null ? vm - dm : null;
+      R.sites.push({ url: u, direct: dm, relay: vm, relayTotal: vtm, worker: wm, overhead: over, status: st });
+      rows.push('<tr><td>' + esc(u) + (err && vm == null ? '<div class="sub warn">' + esc(err) + '</div>' : '') + '</td><td class="num">' + ms(dm) + '</td><td class="num">' + ms(vm) + '</td><td class="num">' + ms(vtm) + '</td><td class="num">' + ms(wm) + '</td><td class="num ' + (over != null && over > 250 ? 'warn' : '') + '">' + (over == null ? 'n/a' : (over >= 0 ? '+' : '') + Math.round(over) + ' ms') + '</td></tr>');
+      note('Site ' + u + ': direct ' + ms(dm) + ', via relay first byte ' + ms(vm) + ', via relay total ' + ms(vtm) + ', Worker to site first byte ' + ms(wm) + ', relay overhead ' + (over == null ? 'n/a' : Math.round(over) + ' ms') + (st ? ', HTTP ' + st : ''));
+    }
+    $('rSites').innerHTML = '<table><tr><th>Site</th><th class="num">Direct, first byte</th><th class="num">Via relay, first byte</th><th class="num">Via relay, whole</th><th class="num">Worker to site, first byte</th><th class="num">Relay overhead</th></tr>' + rows.join('') + '</table>' +
+      '<p class="sub">Median of three runs. "Direct" is your browser straight to the site (no-cors, first byte only). The overhead is via-relay minus direct: your connection to Cloudflare plus the Worker\\'s work, minus any shortcut Cloudflare has to the site.</p>';
+    show('sSites');
+  }
+
+  // ---- WebSocket --------------------------------------------------------------
+  function wsEcho(url, count, gap) {
+    return new Promise(function (resolve) {
+      var res = { ok: false, openMs: null, rtts: [], sent: 0, error: null, code: null };
+      var ws, timer, t0 = now();
+      try { ws = new WebSocket(url); } catch (e) { res.error = String(e && e.message ? e.message : e); resolve(res); return; }
+      ws.onopen = function () {
+        res.ok = true;
+        res.openMs = now() - t0;
+        var i = 0;
+        timer = setInterval(function () {
+          if (i >= count) {
+            clearInterval(timer);
+            setTimeout(function () { try { ws.close(); } catch (e) {} }, 1200);
+            return;
+          }
+          try { ws.send('rt:' + i + ':' + now()); res.sent++; } catch (e) {}
+          i++;
+        }, gap);
+      };
+      ws.onmessage = function (ev) {
+        var d = String(ev.data);
+        if (d.indexOf('rt:') === 0) {
+          var p = d.split(':');
+          var t = parseFloat(p[2]);
+          if (!isNaN(t)) res.rtts.push(now() - t);
+        }
+      };
+      ws.onerror = function () { if (!res.ok) res.error = 'could not connect'; };
+      ws.onclose = function (ev) { clearInterval(timer); res.code = ev.code; res.reason = ev.reason; resolve(res); };
+      setTimeout(function () { try { ws.close(); } catch (e) {} }, count * gap + 9000);
+    });
+  }
+  function wsSummary(r) {
+    if (!r.ok) return null;
+    var a = r.rtts;
+    var jit = 0;
+    for (var k = 1; k < a.length; k++) jit += Math.abs(a[k] - a[k - 1]);
+    jit = a.length > 1 ? jit / (a.length - 1) : 0;
+    return { open: r.openMs, min: a.length ? Math.min.apply(null, a) : null, median: median(a), max: a.length ? Math.max.apply(null, a) : null, jitter: jit, lost: r.sent - a.length, sent: r.sent };
+  }
+  function wsRows(title, s, r) {
+    if (!s) return row(title, esc(r.error || 'failed') + (r.code ? ' (close ' + r.code + (r.reason ? ': ' + esc(r.reason) : '') + ')' : ''), 'warn');
+    return row(title + ': connect', ms(s.open)) +
+      row(title + ': round trip, median', ms(s.median), s.median < 60 ? 'good' : (s.median > 120 ? 'warn' : '')) +
+      row(title + ': best / worst', ms(s.min) + ' / ' + ms(s.max)) +
+      row(title + ': jitter', ms(s.jitter), s.jitter > 25 ? 'warn' : '') +
+      row(title + ': lost messages', s.lost + ' of ' + s.sent, s.lost > 0 ? 'warn' : '');
+  }
+  async function doWs() {
+    var base = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+    status('WebSocket (Worker echo)...');
+    var a = await wsEcho(base + '/__relay_speed/ws', 25, 100);
+    bar(0.88);
+    var sa = wsSummary(a);
+    var html = '<table>' + wsRows('Browser <-> Worker', sa, a);
+    var custom = $('wsCustom').value.trim();
+    var sb = null, b = null;
+    if (custom) {
+      status('WebSocket (through the bridge)...');
+      b = await wsEcho(base + '/' + custom, 25, 100);
+      sb = wsSummary(b);
+      html += wsRows('Through the bridge to ' + esc(custom), sb, b);
+    }
+    $('rWs').innerHTML = html + '</table><p class="sub">A game sends many small messages and waits for the answer; the round-trip time is its lag, and jitter is how much that lag changes.</p>';
+    show('sWs');
+    R.ws = sa;
+    R.wsBridge = sb;
+    note('WebSocket (Worker echo): ' + (sa ? 'median ' + ms(sa.median) + ', best ' + ms(sa.min) + ', worst ' + ms(sa.max) + ', jitter ' + ms(sa.jitter) + ', lost ' + sa.lost + '/' + sa.sent : 'failed: ' + (a.error || a.code)));
+    if (custom) note('WebSocket (bridge to ' + custom + '): ' + (sb ? 'median ' + ms(sb.median) + ', best ' + ms(sb.min) + ', worst ' + ms(sb.max) + ', jitter ' + ms(sb.jitter) + ', lost ' + sb.lost + '/' + sb.sent : 'failed: ' + (b.error || b.code) + (b.reason ? ' ' + b.reason : '')));
+  }
+
+  // ---- verdict ----------------------------------------------------------------
+  function verdict() {
+    var out = [];
+    var L = R.lat, X = R.xfer, S = R.sites || [];
+    if (L) {
+      var m = L.median;
+      out.push(m < 40 ? 'Your connection to Cloudflare is very fast (' + ms(m) + ').' : m < 100 ? 'Your connection to Cloudflare is good (' + ms(m) + ').' : m < 200 ? 'Your connection to Cloudflare is slow-ish (' + ms(m) + '); every request pays this.' : 'Your connection to Cloudflare is slow (' + ms(m) + '): every request, and every game message, pays this. Check which Cloudflare location serves you and your own network first.');
+      if (L.jitter > 30) out.push('Latency varies a lot (jitter ' + ms(L.jitter) + '): games and video may stutter even if the average is fine.');
+      if (L.info && L.info.http && L.info.http.indexOf('HTTP/1') === 0) out.push('The connection to the relay is ' + L.info.http + ', not HTTP/2 or HTTP/3: many requests in parallel will be slower.');
+    }
+    if (X) {
+      var d = X.down.mbps;
+      out.push(d > 100 ? 'Download through the relay is fast (' + mbps(d) + ').' : d > 25 ? 'Download through the relay is fine for video and large files (' + mbps(d) + ').' : d > 5 ? 'Download through the relay is modest (' + mbps(d) + '): large files and video will be slow.' : 'Download through the relay is slow (' + mbps(d) + ').');
+      if (X.par.mbps < X.down.mbps * 0.8) out.push('Four connections at once were not faster than one: the limit is your connection or the relay, not the number of requests.');
+      if (X.up.mbps < X.down.mbps * 0.05) out.push('Upload is much slower than download (' + mbps(X.up.mbps) + '): uploads and posting large forms will feel slow.');
+    }
+    if (S.length) {
+      var slowW = S.filter(function (s) { return s.worker != null && s.worker > 400; });
+      var overs = S.filter(function (s) { return s.overhead != null; }).map(function (s) { return s.overhead; });
+      var mo = median(overs);
+      if (mo != null) out.push(mo < 0 ? 'Going through the relay was not slower than going direct (about ' + Math.round(-mo) + ' ms faster): Cloudflare has a shorter path to these sites than your connection does.' : mo < 100 ? 'The relay adds little over going direct (about ' + Math.round(mo) + ' ms per request).' : mo < 300 ? 'The relay adds about ' + Math.round(mo) + ' ms to a request compared with going direct.' : 'The relay adds about ' + Math.round(mo) + ' ms to a request: noticeable on pages with many requests.');
+      if (slowW.length && L && L.median < 100) out.push('The slow part is Cloudflare to the site (' + slowW.map(function (s) { return s.url + ' ' + ms(s.worker); }).join(', ') + '), not your connection. Smart Placement (README, Speed) runs the Worker near the sites it talks to and may help; measure again after trying it.');
+    }
+    if (R.ws) {
+      var w = R.ws.median;
+      out.push(w < 50 ? 'WebSocket round trip to the Worker is ' + ms(w) + ': fine for fast multiplayer games.' : w < 100 ? 'WebSocket round trip to the Worker is ' + ms(w) + ': fine for most games, noticeable in fast ones.' : 'WebSocket round trip to the Worker is ' + ms(w) + ': fast games will feel laggy.');
+      if (R.ws.lost > 0) out.push(R.ws.lost + ' of ' + R.ws.sent + ' WebSocket messages never came back: the connection drops packets.');
+    }
+    if (R.wsBridge && R.ws) {
+      var extra = R.wsBridge.median - R.ws.median;
+      out.push('Through the bridge to the echo server a message takes ' + ms(R.wsBridge.median) + ', ' + ms(Math.max(0, extra)) + ' more than to the Worker alone: that is the Worker to server leg and the server itself.');
+    }
+    if (!out.length) out.push('Run at least one test group to get a summary.');
+    $('rVerdict').innerHTML = out.map(function (l) { return '<li>' + esc(l) + '</li>'; }).join('');
+    show('sVerdict');
+    for (var i = 0; i < out.length; i++) report.push('=> ' + out[i]);
+  }
+
+  // ---- control ----------------------------------------------------------------
+  function buttons() {
+    $('runBtn').disabled = running;
+    $('stopBtn').disabled = !running;
+    $('copyBtn').disabled = running || !report.length;
+  }
+  async function runAll() {
+    if (running) return;
+    running = true;
+    ctl = new AbortController();
+    report = [];
+    R = {};
+    ['sLat', 'sXfer', 'sSites', 'sWs', 'sVerdict'].forEach(function (id) { $(id).hidden = true; });
+    bar(0);
+    buttons();
+    report.push('Relay speed test, ' + new Date().toISOString() + ', ' + location.host);
+    try {
+      if ($('gLat').checked) await doLatency();
+      if ($('gXfer').checked) await doTransfer();
+      if ($('gSites').checked) await doSites();
+      if ($('gWs').checked) await doWs();
+      bar(1);
+      verdict();
+      status('Done.');
+    } catch (e) {
+      status(e && e.name === 'AbortError' ? 'Stopped.' : 'Stopped: ' + (e && e.message ? e.message : e));
+      if (Object.keys(R).length) verdict();
+    }
+    running = false;
+    buttons();
+  }
+  $('runBtn').addEventListener('click', runAll);
+  $('stopBtn').addEventListener('click', function () { if (ctl) ctl.abort(); });
+  $('copyBtn').addEventListener('click', function () {
+    var text = report.join('\\n');
+    var b = $('copyBtn');
+    function done(ok) { b.textContent = ok ? 'Copied!' : 'Copy failed'; setTimeout(function () { b.textContent = 'Copy results'; }, 1500); }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+    else done(false);
+  });
+  buttons();
+})();
+</script>
+</body>
+</html>`;
+}
+
 // ---- Hardening helpers --------------------------------------------------------
 async function sha256Bytes(text) {
   return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text))));
@@ -2134,6 +2716,10 @@ function settingsPage(o) {
       '<div class="actions"><button type="submit">Import</button></div></form></section>'
     : '';
 
+  const speedSection = '<section><h2>Speed test</h2>' +
+    '<p>Measures the relay hop by hop: your connection to Cloudflare, the Worker\'s download and upload speed, Cloudflare to the sites you use, and a WebSocket round trip (what multiplayer games feel). Use it to see where time goes before changing anything.</p>' +
+    '<div class="actions"><a class="btn" href="' + SPEED_PATH + '">Open speed test</a></div></section>';
+
   const ipSection = IP_WIDGET
     ? '<section><h2>Your IP</h2><p>Your address as Cloudflare sees it, and the address sites see when the relay fetches for you. Nothing is looked up until you press the button.</p>' +
       '<div class="actions"><button type="button" id="ipBtn">Check my IP</button></div>' +
@@ -2224,6 +2810,7 @@ function settingsPage(o) {
 
     ${privacySection}
     ${frameSection}
+    ${speedSection}
     ${ipSection}
     ${cookieSection}
     ${importSection}
@@ -2655,6 +3242,7 @@ async function handleRelayRequest(request, env, ctx) {
     }
 
     if (request.headers.get('Upgrade') === 'websocket') {
+      if (url.pathname === SPEED_API + 'ws') return speedWsEcho(request, proxyOrigin);
       return handleWebSocketUpgrade(request, url, proxyOrigin);
     }
 
@@ -2715,6 +3303,18 @@ async function handleRelayRequest(request, env, ctx) {
     // a proxied page's own /__relay_ip link, if it had one, is not "repaired".
     if (IP_WIDGET && url.pathname === IP_PATH && (request.method === 'GET' || request.method === 'HEAD')) {
       return ipInfoResponse(request);
+    }
+
+    // Speed test: the endpoints it measures (before escape recovery, so a proxied
+    // page's own /__relay_speed/ path is never "repaired") and its page.
+    if (url.pathname.indexOf(SPEED_API) === 0) {
+      return handleSpeedApi(request, url, proxyOrigin);
+    }
+    if (url.pathname === SPEED_PATH && isRelayOwnRequest(request, url, proxyOrigin)) {
+      return new Response(speedPage(), {
+        status: 200,
+        headers: Object.assign({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }, OWN_PAGE_HEADERS)
+      });
     }
 
     // Settings page (theme, browsing mode, debug bar, IP, cookie jar, log out).
